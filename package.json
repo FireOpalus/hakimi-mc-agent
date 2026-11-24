@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node --test test/bridge.test.mjs"
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "mineflayer": "^4.39.0",
