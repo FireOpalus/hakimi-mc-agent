@@ -11,7 +11,9 @@ import { createShelterState, executeShelterAction } from "../src/world_actions.m
 import {
   HAZARD_AVOID_BLOCKS,
   MOVEMENT_PROFILES,
+  PAPER_SAFE_PLAYER_HALF_WIDTH,
   applyMovementProfile,
+  applyPaperPhysicsMargin,
   createMovementProfile,
   installPillarPlaceGuard,
   isNaturalRockBlock,
@@ -1042,4 +1044,14 @@ test("v2.10.3: explore appends surface-escape GoalNear when trapped in a pit and
   assert.equal(acqRes.blocker_item, "oak_log");
   assert.equal(acqRes.wood_shortfall_logs, 1);
   assert.match(acqRes.summary, /还需约1根原木/);
+});
+
+test("v2.10.4: applyPaperPhysicsMargin bumps prismarine-physics playerHalfWidth above Java float32 0.3f", () => {
+  const bot = makeRealVoxelBot();
+  bot.physics = { playerHalfWidth: 0.3 };
+  applyMovementProfile(bot, MOVEMENT_PROFILES.CRUISE_WALK);
+  assert.equal(bot.physics.playerHalfWidth, PAPER_SAFE_PLAYER_HALF_WIDTH);
+  assert.ok(bot.physics.playerHalfWidth > Math.fround(0.6) / 2);
+  // Idempotent when already >= safe margin
+  assert.equal(applyPaperPhysicsMargin(bot), false);
 });

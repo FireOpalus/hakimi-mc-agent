@@ -373,6 +373,21 @@ function collectScaffoldItemIds(bot) {
 
 const NON_SOLID_PLACE_ITEMS = new Set(["torch", "soul_torch", "redstone_torch"]);
 
+// Java Edition EntityDimensions.scalable(0.6f, 1.8f) has float32 half-width 0.30000001192092896,
+// strictly larger than JS float64 0.3 by 1.19e-8; without this margin Paper 26.1.2 rubberbands
+// any wall contact via silent S->C position teleports.
+export const PAPER_SAFE_PLAYER_HALF_WIDTH = 0.3005;
+
+export function applyPaperPhysicsMargin(bot) {
+  if (!bot?.physics || typeof bot.physics !== "object") return false;
+  const cur = Number(bot.physics.playerHalfWidth);
+  if (!Number.isFinite(cur) || cur < PAPER_SAFE_PLAYER_HALF_WIDTH) {
+    bot.physics.playerHalfWidth = PAPER_SAFE_PLAYER_HALF_WIDTH;
+    return true;
+  }
+  return false;
+}
+
 /**
  * Guard upward underfoot `placeBlock(refBlock, (0, 1, 0))` calls (mineflayer-pathfinder 1x1 towering
  * and pit-escape pillaring) against Paper/Vanilla entity-hitbox rejection.
@@ -666,8 +681,11 @@ export function applyMovementProfile(
   if (!bot.pathfinder && typeof bot.loadPlugin === "function" && bot.registry?.blocksByName) {
     bot.loadPlugin(pathfinderPkg.pathfinder);
   }
-  if (bot.physics && typeof bot.placeBlock === "function") {
-    installPillarPlaceGuard(bot);
+  if (bot.physics && typeof bot.physics === "object") {
+    applyPaperPhysicsMargin(bot);
+    if (typeof bot.placeBlock === "function") {
+      installPillarPlaceGuard(bot);
+    }
   }
   if (!bot.pathfinder || typeof bot.pathfinder.setMovements !== "function") return null;
   const movements = createMovementProfile(bot, profileName, opts);
