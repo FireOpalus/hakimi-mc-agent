@@ -78,26 +78,23 @@ export const NATURAL_ROCK_TERRAIN_BLOCKS = new Set([
   "end_stone",
 ]);
 
-export const SAFE_SCAFFOLD_BLOCKS = new Set([
+// Pure natural scaffold blocks (never trigger player-build 3x3x3 aura and never burn crafting planks).
+export const NATURAL_SCAFFOLD_BLOCKS = new Set([
   "dirt",
   "coarse_dirt",
-  "cobblestone",
-  "cobbled_deepslate",
-  "netherrack",
-  "sandstone",
-  "andesite",
-  "diorite",
   "granite",
+  "diorite",
+  "andesite",
   "tuff",
-  "oak_planks",
-  "birch_planks",
-  "spruce_planks",
-  "jungle_planks",
-  "acacia_planks",
-  "dark_oak_planks",
-  "mangrove_planks",
-  "cherry_planks",
-  "pale_oak_planks",
+  "sandstone",
+  "netherrack",
+]);
+
+export const FALLBACK_SCAFFOLD_BLOCKS = new Set(["cobblestone", "cobbled_deepslate"]);
+
+export const SAFE_SCAFFOLD_BLOCKS = new Set([
+  ...NATURAL_SCAFFOLD_BLOCKS,
+  ...FALLBACK_SCAFFOLD_BLOCKS,
 ]);
 
 export const HAZARD_AVOID_BLOCKS = new Set([
@@ -356,8 +353,15 @@ function collectScaffoldItemIds(bot) {
   const ids = [];
   const itemsByName = bot?.registry?.itemsByName;
   if (!itemsByName) return ids;
+  const hasNaturalInInv = getInventoryItems(bot).some((it) =>
+    NATURAL_SCAFFOLD_BLOCKS.has(extractCanonicalItemName(it)),
+  );
+  // Prefer pure natural blocks exclusively whenever carried, because mineflayer-pathfinder's
+  // getScaffoldingItem() scans inventory slots in order and would otherwise grab slot-0 cobblestone
+  // ahead of dirt, planting player-build aura blocks inside the bot's own escape tunnel.
+  const allowedSet = hasNaturalInInv ? NATURAL_SCAFFOLD_BLOCKS : SAFE_SCAFFOLD_BLOCKS;
   const seen = new Set();
-  for (const name of SAFE_SCAFFOLD_BLOCKS) {
+  for (const name of allowedSet) {
     const def = itemsByName[name];
     if (def && typeof def.id === "number" && !seen.has(def.id)) {
       seen.add(def.id);
@@ -365,6 +369,89 @@ function collectScaffoldItemIds(bot) {
     }
   }
   return ids;
+}
+
+const NON_SOLID_PLACE_ITEMS = new Set(["torch", "soul_torch", "redstone_torch"]);
+
+/**
+ * Guard upward underfoot `placeBlock(refBlock, (0, 1, 0))` calls (mineflayer-pathfinder 1x1 towering
+ * and pit-escape pillaring) against Paper/Vanilla entity-hitbox rejection.
+ * Upstream mineflayer-pathfinder fires placeBlock as soon as `y > placingBlock.y + 1` (e.g. +0.42),
+ * while feet still overlap `[ty, ty + 1.0)`, causing Paper to reject and mineflayer to hang 5000ms.
+ * Waiting for `physicsTick` until `y >= ty + 1.0` (~200-250ms jump apex) makes pillaring succeed
+ * on the first jump, and fails fast (`pillar_jump_blocked`) if a ceiling blocks the jump.
+ */
+export function installPillarPlaceGuard(bot, { maxWaitMs = 700, pollIntervalMs = 25 } = {}) {
+  if (!bot || typeof bot.placeBlock !== "function" || bot._hakimiPillarGuardInstalled) {
+    return bot;
+  }
+  const rawPlaceBlock = bot.placeBlock.bind(bot);
+  bot._hakimiPillarGuardInstalled = true;
+  bot.placeBlock = async function guardedPlaceBlock(refBlock, faceVec, ...rest) {
+    const isUpwardFace =
+      faceVec &&
+      Math.round(Number(faceVec.x ?? 0)) === 0 &&
+      Math.round(Number(faceVec.y ?? 0)) === 1 &&
+      Math.round(Number(faceVec.z ?? 0)) === 0;
+    const heldName = extractCanonicalItemName(bot.heldItem);
+    const refPos = refBlock?.position;
+    const entityPos = bot.entity?.position;
+    if (isUpwardFace && !NON_SOLID_PLACE_ITEMS.has(heldName) && refPos && entityPos) {
+      const tx = Math.floor(refPos.x);
+      const ty = Math.floor(refPos.y) + 1;
+      const tz = Math.floor(refPos.z);
+      const horizOverlap =
+        Math.abs(entityPos.x - (tx + 0.5)) < 0.8 && Math.abs(entityPos.z - (tz + 0.5)) < 0.8;
+      if (horizOverlap && entityPos.y >= ty - 0.15 && entityPos.y < ty + 1.0) {
+        try {
+          bot.setControlState?.("jump", true);
+        } catch {
+          // Ignore jump control errors
+        }
+        const cleared = await new Promise((resolve) => {
+          let settled = false;
+          let timer = null;
+          let poll = null;
+          const done = (ok) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            if (poll) clearInterval(poll);
+            bot.removeListener?.("physicsTick", check);
+            resolve(ok);
+          };
+          const check = () => {
+            const p = bot.entity?.position;
+            if (!p) {
+              done(false);
+              return;
+            }
+            const stillHoriz =
+              Math.abs(p.x - (tx + 0.5)) < 0.8 && Math.abs(p.z - (tz + 0.5)) < 0.8;
+            if (!stillHoriz || p.y >= ty + 1.0 || p.y < ty - 0.5) {
+              done(true);
+            }
+          };
+          bot.on?.("physicsTick", check);
+          if (pollIntervalMs > 0) {
+            poll = setInterval(check, pollIntervalMs);
+          }
+          timer = setTimeout(() => done(false), Math.max(50, maxWaitMs));
+          check();
+        });
+        if (!cleared) {
+          try {
+            bot.setControlState?.("jump", false);
+          } catch {
+            // Ignore jump release errors
+          }
+          throw new Error("pillar_jump_blocked");
+        }
+      }
+    }
+    return await rawPlaceBlock(refBlock, faceVec, ...rest);
+  };
+  return bot;
 }
 
 function resolveProfileSpec(bot, profileName, opts = {}) {
@@ -578,6 +665,9 @@ export function applyMovementProfile(
   if (!bot) return null;
   if (!bot.pathfinder && typeof bot.loadPlugin === "function" && bot.registry?.blocksByName) {
     bot.loadPlugin(pathfinderPkg.pathfinder);
+  }
+  if (bot.physics && typeof bot.placeBlock === "function") {
+    installPillarPlaceGuard(bot);
   }
   if (!bot.pathfinder || typeof bot.pathfinder.setMovements !== "function") return null;
   const movements = createMovementProfile(bot, profileName, opts);

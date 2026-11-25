@@ -1233,9 +1233,19 @@ export function isDirectlyUnderfoot(bot, pos) {
 
 const SHELTER_CAP_BLOCKS = new Set([
   "dirt",
+  "coarse_dirt",
+  "rooted_dirt",
+  "mud",
+  "moss_block",
+  "granite",
+  "diorite",
+  "andesite",
+  "tuff",
+  "sandstone",
+  "netherrack",
+  "stone",
   "cobblestone",
   "cobbled_deepslate",
-  "stone",
   "oak_planks",
   "spruce_planks",
   "birch_planks",
@@ -1244,11 +1254,23 @@ const SHELTER_CAP_BLOCKS = new Set([
   "dark_oak_planks",
   "mangrove_planks",
   "cherry_planks",
-  "sandstone",
-  "netherrack",
-  "andesite",
-  "diorite",
-  "granite",
+]);
+
+const SHELTER_CAP_PRIORITY = new Map([
+  ["dirt", 1],
+  ["coarse_dirt", 2],
+  ["rooted_dirt", 2],
+  ["mud", 2],
+  ["moss_block", 2],
+  ["granite", 3],
+  ["diorite", 3],
+  ["andesite", 3],
+  ["tuff", 3],
+  ["sandstone", 3],
+  ["netherrack", 3],
+  ["stone", 4],
+  ["cobblestone", 5],
+  ["cobbled_deepslate", 5],
 ]);
 
 const SHELTER_DIGGABLE_TERRAIN = new Set([
@@ -1521,9 +1543,16 @@ export async function executeShelterAction(
       SHELTER_CAP_BLOCKS.has(extractCanonicalItemName(it)),
     );
     if (items.length === 0) return null;
-    // Prefer a cap block that can be dug back out with current tools (e.g. dirt/planks when barehanded).
-    const harvestable = items.find((it) => checkHarvestToolTier(bot, extractCanonicalItemName(it)).ok);
-    return harvestable || items[0];
+    // Prefer harvestable pure natural blocks (dirt/granite) over cobblestone/planks so sealing
+    // never burns crafting planks or plants player-build aura blocks inside the bot's own pit.
+    const capRank = (it) => {
+      const name = extractCanonicalItemName(it);
+      const harvestPenalty = checkHarvestToolTier(bot, name).ok ? 0 : 100;
+      const baseRank = SHELTER_CAP_PRIORITY.get(name) ?? (name.endsWith("_planks") ? 20 : 10);
+      return harvestPenalty + baseRank;
+    };
+    items.sort((a, b) => capRank(a) - capRank(b));
+    return items[0];
   };
 
   const countCapBlocks = () => {

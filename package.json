@@ -1,6 +1,6 @@
 {
   "name": "hakimi-mc-agent",
-  "version": "2.10.2",
+  "version": "2.10.3",
   "private": true,
   "type": "module",
   "description": "Standalone pure-JS Mineflayer WebSocket sidecar for hakimi-surf CN node",

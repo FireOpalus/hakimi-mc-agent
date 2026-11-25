@@ -361,6 +361,8 @@ export async function executeAcquireAction(
     visiting: new Set(),
     blockerReason: "",
     blockerItem: "",
+    woodShortfallLogs: 0,
+    woodShortfallPlanks: 0,
   };
 
   const checkInterrupt = () => {
@@ -852,30 +854,68 @@ export async function executeAcquireAction(
           { sameSpeciesMin: recipe.sameSpeciesPlanks ? recipePlanks : 0 },
           depth + 1,
         );
-        if (!woodRes.ok) return woodRes;
+        if (!woodRes.ok) {
+          const curWood = computeWoodInventory(countInventoryByName(bot));
+          const remPlanks = Math.max(0, totalPlanksNeed - curWood.totalPotentialPlanks);
+          if (remPlanks > 0) {
+            ctx.woodShortfallPlanks = Math.max(ctx.woodShortfallPlanks, remPlanks);
+            ctx.woodShortfallLogs = Math.max(ctx.woodShortfallLogs, Math.ceil(remPlanks / 4));
+          }
+          return woodRes;
+        }
       }
 
       const intrCraft = checkInterrupt();
       if (intrCraft) return { ok: false, reason: intrCraft.reason, item: target };
 
-      ctx.stepCount += 1;
-      let craftRes;
-      try {
-        craftRes = await executeCraftAction(
-          bot,
-          { item_name: target, count: Math.min(16, need) },
-          {
-            gotoFn,
-            autoEquip: autoEquip && depth === 0,
-            signal,
-            isUnreachableFn,
-            markUnreachableFn,
-          },
-        );
-      } catch {
-        craftRes = { ok: false, reason: "craft_failed" };
-      }
+      const attemptCraft = async () => {
+        ctx.stepCount += 1;
+        try {
+          return await executeCraftAction(
+            bot,
+            { item_name: target, count: Math.min(16, need) },
+            {
+              gotoFn,
+              autoEquip: autoEquip && depth === 0,
+              signal,
+              isUnreachableFn,
+              markUnreachableFn,
+            },
+          );
+        } catch {
+          return { ok: false, reason: "craft_failed" };
+        }
+      };
+
+      let craftRes = await attemptCraft();
       if (craftRes?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
+      // If a remote crafting table within 16 blocks proved unreachable, executeCraftAction falls back
+      // to local table crafting and may report wood_shortfall_logs > 0. Try gathering logs once before giving up.
+      if (
+        !craftRes?.ok &&
+        craftRes?.reason === "no_crafting_table" &&
+        (craftRes.wood_shortfall_logs ?? 0) > 0
+      ) {
+        ctx.woodShortfallLogs = Math.max(ctx.woodShortfallLogs, Number(craftRes.wood_shortfall_logs) || 0);
+        ctx.woodShortfallPlanks = Math.max(
+          ctx.woodShortfallPlanks,
+          Number(craftRes.wood_shortfall_planks) || 0,
+        );
+        if (depth < ctx.maxDepth - 1 && !checkInterrupt()) {
+          const tableWoodNeed = 4 + recipePlanks + planksForSticks;
+          const retryWood = await ensureWoodPlanks(
+            tableWoodNeed,
+            { sameSpeciesMin: recipe.sameSpeciesPlanks ? recipePlanks : 0 },
+            depth + 1,
+          );
+          if (retryWood.ok && !checkInterrupt()) {
+            ctx.woodShortfallLogs = 0;
+            ctx.woodShortfallPlanks = 0;
+            craftRes = await attemptCraft();
+            if (craftRes?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
+          }
+        }
+      }
       if (craftRes?.ok) {
         ctx.steps.push(`craft:${target}x${craftRes.crafted_count}`);
         return {
@@ -883,6 +923,13 @@ export async function executeAcquireAction(
           crafted_count: craftRes.crafted_count,
           equipped_items: craftRes.equipped_items || [],
         };
+      }
+      if ((craftRes?.wood_shortfall_logs ?? 0) > 0) {
+        ctx.woodShortfallLogs = Math.max(ctx.woodShortfallLogs, Number(craftRes.wood_shortfall_logs) || 0);
+        ctx.woodShortfallPlanks = Math.max(
+          ctx.woodShortfallPlanks,
+          Number(craftRes.wood_shortfall_planks) || 0,
+        );
       }
       recordBlocker(craftRes?.reason || "craft_failed", target);
       return { ok: false, reason: craftRes?.reason || "craft_failed", item: target };
@@ -917,6 +964,8 @@ export async function executeAcquireAction(
   const blockerItem = ctx.blockerItem || finalRes.item || effectiveTarget;
   const partialNote =
     ctx.steps.length > 0 ? `；已完成: ${ctx.steps.slice(-4).join(" -> ")}` : "";
+  const woodHint =
+    ctx.woodShortfallLogs > 0 ? `，还需约${ctx.woodShortfallLogs}根原木` : "";
   return {
     ok: false,
     accepted: true,
@@ -928,6 +977,12 @@ export async function executeAcquireAction(
     partial: ctx.steps.length > 0 || acquiredCount > 0,
     steps_completed: ctx.steps.slice(0, 8),
     blocker_item: blockerItem,
-    summary: `自动筹料${effectiveTarget}在 ${blockerItem} 受阻(${blockerReason})${partialNote}`,
+    ...(ctx.woodShortfallLogs > 0
+      ? {
+          wood_shortfall_logs: ctx.woodShortfallLogs,
+          wood_shortfall_planks: ctx.woodShortfallPlanks,
+        }
+      : {}),
+    summary: `自动筹料${effectiveTarget}在 ${blockerItem} 受阻(${blockerReason}${woodHint})${partialNote}`,
   };
 }

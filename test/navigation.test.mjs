@@ -5,12 +5,15 @@ import { createRequire } from "node:module";
 import vec3 from "vec3";
 import pathfinderPkg from "mineflayer-pathfinder";
 import { McRuntime } from "../src/behaviors.mjs";
+import { executeAcquireAction } from "../src/acquire.mjs";
 import { loadConfig } from "../src/protocol.mjs";
+import { createShelterState, executeShelterAction } from "../src/world_actions.mjs";
 import {
   HAZARD_AVOID_BLOCKS,
   MOVEMENT_PROFILES,
   applyMovementProfile,
   createMovementProfile,
+  installPillarPlaceGuard,
   isNaturalRockBlock,
   isNaturalSoftBlock,
   isNearPlayerStructure,
@@ -842,4 +845,201 @@ test("v2.10.2: shelter exit picks open-air direction over crafting_table/stone w
   } finally {
     rt.stop();
   }
+});
+
+test("v2.10.3: installPillarPlaceGuard waits for jump apex (y >= ty+1) on Paper, fails fast under ceiling, and skips torches", async () => {
+  const placedAtY = [];
+  const bot = new EventEmitter();
+  bot.entity = { position: vec3(-1.5, 72.42, -2.5) };
+  bot.heldItem = { name: "dirt", type: 3, count: 10 };
+  bot.setControlState = () => {};
+  bot.placeBlock = async () => {
+    placedAtY.push(bot.entity.position.y);
+  };
+  installPillarPlaceGuard(bot, { maxWaitMs: 200, pollIntervalMs: 10 });
+
+  // 1. Underfoot jump-place at y=72.42 waits until physicsTick lifts feet to y=73.05
+  const refGround = { position: vec3(-2, 71, -3), name: "stone" };
+  setTimeout(() => {
+    bot.entity.position = vec3(-1.5, 72.75, -2.5);
+    bot.emit("physicsTick");
+  }, 15);
+  setTimeout(() => {
+    bot.entity.position = vec3(-1.5, 73.05, -2.5);
+    bot.emit("physicsTick");
+  }, 35);
+  await bot.placeBlock(refGround, vec3(0, 1, 0));
+  assert.deepEqual(placedAtY, [73.05]);
+
+  // 2. Ceiling blocking jump -> rejects fast with pillar_jump_blocked instead of 5s timeout
+  bot.entity.position = vec3(-1.5, 72.42, -2.5);
+  await assert.rejects(() => bot.placeBlock(refGround, vec3(0, 1, 0)), /pillar_jump_blocked/);
+
+  // 3. Torch placement at feet passes through immediately without waiting
+  bot.heldItem = { name: "torch", type: 50, count: 4 };
+  await bot.placeBlock(refGround, vec3(0, 1, 0));
+  assert.deepEqual(placedAtY, [73.05, 72.42]);
+});
+
+test("v2.10.3: natural scaffold & shelter cap priority never burn slot-0 oak_planks or plant cobblestone when dirt exists", async () => {
+  // Exact live Geminy inventory order: slot 0 oak_planks, slot 1 cobblestone, slot 2 granite, slot 3 dirt
+  const bot = makeRealVoxelBot({
+    pos: vec3(0.5, 64, 0.5),
+    items: [
+      { name: "oak_planks", count: 2 },
+      { name: "cobblestone", count: 64 },
+      { name: "granite", count: 15 },
+      { name: "dirt", count: 43 },
+    ],
+    blockFn: (x, y, z) => (y <= 63 ? "dirt" : "air"),
+  });
+
+  // 1. A* scafoldingBlocks contains dirt & granite, NEVER oak_planks and NEVER cobblestone when natural blocks exist
+  const moves = createMovementProfile(bot, MOVEMENT_PROFILES.NATURAL_TRAVERSE);
+  const dirtId = bot.registry.itemsByName.dirt.id;
+  const graniteId = bot.registry.itemsByName.granite.id;
+  const cobbleId = bot.registry.itemsByName.cobblestone.id;
+  const planksId = bot.registry.itemsByName.oak_planks.id;
+  assert.equal(moves.scafoldingBlocks.includes(dirtId), true);
+  assert.equal(moves.scafoldingBlocks.includes(graniteId), true);
+  assert.equal(moves.scafoldingBlocks.includes(cobbleId), false);
+  assert.equal(moves.scafoldingBlocks.includes(planksId), false);
+
+  // 2. executeShelterAction seals with dirt (rank 1), NOT slot-0 oak_planks or slot-1 cobblestone
+  const placedNames = [];
+  bot.equip = async (it) => {
+    bot.heldItem = it;
+  };
+  bot.dig = async () => {
+    bot.entity.position = vec3(0.5, 61, 0.5);
+  };
+  bot.placeBlock = async () => {
+    placedNames.push(bot.heldItem?.name);
+  };
+  bot.lookAt = async () => {};
+  const shRes = await executeShelterAction(
+    bot,
+    { mode: "enter" },
+    { shelterState: createShelterState(), timeOfDay: "night", settleTimeoutMs: 50, settlePollMs: 0 },
+  );
+  assert.equal(shRes.ok, true);
+  assert.deepEqual(placedNames, ["dirt"]);
+});
+
+test("v2.10.3: explore appends surface-escape GoalNear when trapped in a pit and acquire surfaces wood_shortfall_logs", async () => {
+  // 1. Pit-trapped bot: 4 walls around (0,64,0) up to y=66, open surface at x=3, y=67, z=0
+  const pitBot = makeLightRuntimeBot({
+    pos: vec3(0.5, 64, 0.5),
+    items: [{ name: "dirt", type: 3, count: 16 }],
+    blockFn: (x, y, z) => {
+      if (x === 0 && z === 0) return y <= 63 ? "stone" : "air";
+      if (y <= 66) return "stone";
+      return "air";
+    },
+  });
+  const goalsTried = [];
+  pitBot.pathfinder.goto = async (goal) => {
+    goalsTried.push(goal);
+    if (goal.y === undefined) {
+      throw new Error("no_path");
+    }
+    // Surface escape GoalNear succeeded!
+    pitBot.entity.position = vec3(goal.x + 0.5, goal.y, goal.z + 0.5);
+  };
+  const pitRt = new McRuntime({
+    config: makeRuntimeConfig(),
+    createBotFn: () => pitBot,
+    stuckCheckIntervalMs: 5_000,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  try {
+    pitRt.connectBot();
+    pitBot.emit("spawn");
+    const res = await pitRt.dispatchGoal({ action_type: "explore" });
+    assert.equal(res.ok, true);
+    assert.ok(goalsTried.some((g) => typeof g.y === "number" && g.y >= 66));
+    assert.ok(pitBot.entity.position.y >= 66);
+  } finally {
+    pitRt.stop();
+  }
+
+  // 2. acquire(stone_pickaxe) when remote crafting_table is unreachable and only 1 oak_plank owned
+  //    surfaces wood_shortfall_logs >= 1 instead of silently dropping it.
+  const acqBot = makeRealVoxelBot({
+    pos: vec3(0.5, 64, 0.5),
+    items: [
+      { name: "cobblestone", count: 10 },
+      { name: "stick", count: 3 },
+      { name: "oak_planks", count: 1 },
+    ],
+    blockFn: (x, y, z) => {
+      if (x === 8 && y === 64 && z === 0) return "crafting_table";
+      return y <= 63 ? "stone" : "air";
+    },
+  });
+  acqBot.findBlocks = ({ matching }) => {
+    const tbl = acqBot.blockAt(vec3(8, 64, 0));
+    return matching(tbl) ? [tbl.position] : [];
+  };
+  acqBot.findBlock = ({ matching }) => {
+    const hits = acqBot.findBlocks({ matching });
+    return hits.length > 0 ? acqBot.blockAt(hits[0]) : null;
+  };
+  const stonePickId = acqBot.registry.itemsByName.stone_pickaxe.id;
+  const cobbleId = acqBot.registry.itemsByName.cobblestone.id;
+  const stickId = acqBot.registry.itemsByName.stick.id;
+  const tableId = acqBot.registry.itemsByName.crafting_table.id;
+  const planksId = acqBot.registry.itemsByName.oak_planks.id;
+  acqBot.recipesAll = (id, _meta, tableHint) => {
+    if (id === stonePickId && tableHint) {
+      return [
+        {
+          requiresTable: true,
+          result: { id: stonePickId, count: 1 },
+          delta: [
+            { id: cobbleId, count: -3 },
+            { id: stickId, count: -2 },
+            { id: stonePickId, count: 1 },
+          ],
+        },
+      ];
+    }
+    if (id === tableId) {
+      return [
+        {
+          requiresTable: false,
+          result: { id: tableId, count: 1 },
+          delta: [
+            { id: planksId, count: -4 },
+            { id: tableId, count: 1 },
+          ],
+        },
+      ];
+    }
+    return [];
+  };
+  acqBot.recipesFor = (id, _meta, _minRes, tableHint) => {
+    if (id === stonePickId && tableHint) {
+      return acqBot.recipesAll(id, null, tableHint);
+    }
+    return [];
+  };
+  acqBot.craft = async () => {};
+  const acqRes = await executeAcquireAction(
+    acqBot,
+    { item_name: "stone_pickaxe", count: 1 },
+    {
+      gotoFn: async () => {
+        throw new Error("path_stuck");
+      },
+      gatherBlocksFn: async () => ({ ok: false, reason: "block_not_found" }),
+    },
+  );
+  assert.equal(acqRes.ok, false);
+  assert.equal(acqRes.reason, "block_not_found");
+  assert.equal(acqRes.blocker_item, "oak_log");
+  assert.equal(acqRes.wood_shortfall_logs, 1);
+  assert.match(acqRes.summary, /还需约1根原木/);
 });

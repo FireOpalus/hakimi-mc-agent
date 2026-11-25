@@ -7,6 +7,7 @@ import {
   ChatRingBuffer,
   ProtocolError,
   hasForbiddenTargetOverride,
+  normalizeCanonicalItemId,
   normalizePlayerId,
   sanitizeMcText,
 } from "./protocol.mjs";
@@ -35,7 +36,9 @@ import { executeCraftAction, parseCraftParams } from "./crafting.mjs";
 import { executeSmeltAction, parseSmeltParams } from "./smelting.mjs";
 import { executeAcquireAction, parseAcquireParams } from "./acquire.mjs";
 import {
+  HAZARD_AVOID_BLOCKS,
   MOVEMENT_PROFILES,
+  NATURAL_SCAFFOLD_BLOCKS,
   clearBotControlStates,
   isNaturalFoliageBlock,
   isNaturalSoftBlock,
@@ -2344,9 +2347,10 @@ export class McRuntime {
         underfoot && underfoot.boundingBox !== "empty" && underfoot.name !== "air",
       );
       if (headroomClear && underfootSolid) {
-        const pillarItem = getInventoryItems(bot).find((it) =>
-          safePillarBlocks.has(extractCanonicalItemName(it)),
-        );
+        const invItems = getInventoryItems(bot);
+        const pillarItem =
+          invItems.find((it) => NATURAL_SCAFFOLD_BLOCKS.has(extractCanonicalItemName(it))) ||
+          invItems.find((it) => safePillarBlocks.has(extractCanonicalItemName(it)));
         if (pillarItem) {
           try {
             await bot.equip(pillarItem, "hand");
@@ -3150,6 +3154,66 @@ export class McRuntime {
     return await this._executeInGameGoal(actionType, params);
   }
 
+  _findNearbySurfaceEscape(bot, radius = 8) {
+    if (!bot?.entity?.position || typeof bot.blockAt !== "function") return null;
+    const bx = Math.floor(bot.entity.position.x);
+    const by = Math.floor(bot.entity.position.y);
+    const bz = Math.floor(bot.entity.position.z);
+    let wallSides = 0;
+    for (const [dx, dz] of [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+    ]) {
+      const f = bot.blockAt(vec3(bx + dx, by, bz + dz));
+      const h = bot.blockAt(vec3(bx + dx, by + 1, bz + dz));
+      const fSolid = Boolean(f && f.boundingBox !== "empty" && f.name !== "air");
+      const hSolid = Boolean(h && h.boundingBox !== "empty" && h.name !== "air");
+      if (fSolid || hSolid) wallSides += 1;
+    }
+    if (wallSides < 2) return null;
+
+    const isAirLike = (blk) =>
+      !blk ||
+      blk.boundingBox === "empty" ||
+      blk.name === "air" ||
+      blk.name === "cave_air" ||
+      blk.name === "void_air";
+    const isSolidSafe = (blk) => {
+      if (!blk || blk.boundingBox === "empty" || blk.name === "air") return false;
+      const n = normalizeCanonicalItemId(blk.name);
+      return Boolean(n && !HAZARD_AVOID_BLOCKS.has(n) && n !== "water" && n !== "flowing_water");
+    };
+
+    let best = null;
+    for (let r = 2; r <= radius; r += 1) {
+      for (let dx = -r; dx <= r; dx += 1) {
+        for (let dz = -r; dz <= r; dz += 1) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+          for (let sy = by + 2; sy <= by + 10; sy += 1) {
+            const ground = bot.blockAt(vec3(bx + dx, sy - 1, bz + dz));
+            if (!isSolidSafe(ground)) continue;
+            const feet = bot.blockAt(vec3(bx + dx, sy, bz + dz));
+            const head = bot.blockAt(vec3(bx + dx, sy + 1, bz + dz));
+            const sky1 = bot.blockAt(vec3(bx + dx, sy + 2, bz + dz));
+            const sky2 = bot.blockAt(vec3(bx + dx, sy + 3, bz + dz));
+            if (!isAirLike(feet) || !isAirLike(head) || !isAirLike(sky1) || !isAirLike(sky2)) {
+              continue;
+            }
+            const dist = Math.hypot(dx, sy - by, dz);
+            if (!best || dist < best.dist) {
+              best = { x: bx + dx, y: sy, z: bz + dz, dist };
+            }
+            break;
+          }
+        }
+      }
+      if (best) return best;
+    }
+    return null;
+  }
+
   async _executeInGameGoal(actionType, params) {
     const bot = this.bot;
     this._lastActivityOrHumanAtMs = this.nowFn();
@@ -3296,6 +3360,16 @@ export class McRuntime {
       for (let i = 0; i < angleOffsets.length; i += 1) {
         candidates.push({ angle: baseAngle + angleOffsets[i], r: radii[i], label: "探索" });
       }
+      const surfaceEsc = this._findNearbySurfaceEscape(bot, 8);
+      if (surfaceEsc) {
+        candidates.push({
+          tx: surfaceEsc.x,
+          ty: surfaceEsc.y,
+          tz: surfaceEsc.z,
+          label: "脱坑上地面",
+          forceNatural: true,
+        });
+      }
       let targetX =
         candidates[0]?.tx ?? Math.round(startPos[0] + Math.cos(baseAngle) * radii[0]);
       let targetZ =
@@ -3325,11 +3399,15 @@ export class McRuntime {
             cand.tz !== undefined ? cand.tz : Math.round(curNow[2] + Math.sin(cand.angle) * cand.r);
           this.activity = `${cand.label}(${targetX},${targetZ})`;
           const navOpts =
-            attempt >= 1
+            attempt >= 1 || cand.forceNatural
               ? { startProfile: MOVEMENT_PROFILES.NATURAL_TRAVERSE }
               : {};
+          const stepGoal =
+            cand.ty !== undefined
+              ? new GoalNear(targetX, cand.ty, targetZ, 1)
+              : new GoalNearXZ(targetX, targetZ, 2);
           try {
-            await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal, navOpts);
+            await this._gotoGoal(stepGoal, signal, navOpts);
             if (signal.aborted) return { aborted: true };
             const endNow = this._vecToTuple(bot.entity?.position) || curNow;
             const movedTotal = computeExploreProgress(startPos, endNow);
