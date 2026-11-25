@@ -35,6 +35,7 @@ import { executeCraftAction, parseCraftParams } from "./crafting.mjs";
 import { executeSmeltAction, parseSmeltParams } from "./smelting.mjs";
 import { executeAcquireAction, parseAcquireParams } from "./acquire.mjs";
 import {
+  SAFE_UNSTICK_SCAFFOLD_BLOCKS,
   applySafeMovements,
   checkHarvestToolTier,
   createShelterState,
@@ -1776,8 +1777,8 @@ export class McRuntime {
     }
   }
 
-  _ensurePathfinder(bot, { allowDig = false } = {}) {
-    applySafeMovements(bot, { allowDig });
+  _ensurePathfinder(bot, opts = {}) {
+    applySafeMovements(bot, opts);
   }
 
   connectBot() {
@@ -2201,27 +2202,7 @@ export class McRuntime {
       "gravel",
       "clay",
     ]);
-    const safePillarBlocks = new Set([
-      "dirt",
-      "coarse_dirt",
-      "cobblestone",
-      "cobbled_deepslate",
-      "oak_planks",
-      "birch_planks",
-      "spruce_planks",
-      "jungle_planks",
-      "acacia_planks",
-      "dark_oak_planks",
-      "mangrove_planks",
-      "cherry_planks",
-      "pale_oak_planks",
-      "netherrack",
-      "sandstone",
-      "andesite",
-      "diorite",
-      "granite",
-      "tuff",
-    ]);
+    const safePillarBlocks = SAFE_UNSTICK_SCAFFOLD_BLOCKS;
 
     const cardinal = [
       [1, 0],
@@ -2253,16 +2234,18 @@ export class McRuntime {
     }
     if (dug > 0) return true;
 
-    // 2. If trapped inside a natural 2-deep hole/creeper crater (3-4 sides solid at foot and head),
+    // 2. If trapped inside a natural 2-deep hole/creeper crater or cliff-backed stone pocket,
     // carve 1 natural dirt/grass step at head height so the bot can walk out.
+    const isSolidBlock = (blk) => Boolean(blk && blk.boundingBox !== "empty" && blk.name !== "air");
     let enclosedSides = 0;
+    let steepDropSides = 0;
     let escapeStep = null;
     for (const [dx, dz] of cardinal) {
       const footSide = bot.blockAt(vec3(bx + dx, by, bz + dz));
       const headSide = bot.blockAt(vec3(bx + dx, by + 1, bz + dz));
       const aboveHead = bot.blockAt(vec3(bx + dx, by + 2, bz + dz));
-      const footSolid = Boolean(footSide && footSide.boundingBox !== "empty" && footSide.name !== "air");
-      const headSolid = Boolean(headSide && headSide.boundingBox !== "empty" && headSide.name !== "air");
+      const footSolid = isSolidBlock(footSide);
+      const headSolid = isSolidBlock(headSide);
       if (footSolid && headSolid) {
         enclosedSides += 1;
         const aboveClear =
@@ -2270,9 +2253,28 @@ export class McRuntime {
         if (!escapeStep && naturalPitBlocks.has(headSide.name) && aboveClear) {
           escapeStep = { headSide, aboveHead };
         }
+      } else if (!footSolid && !headSolid) {
+        // Check whether stepping this way leads into a >= 4-block drop (blocked by maxDropDown=3).
+        let hasSafeLanding = false;
+        for (let drop = 1; drop <= 4; drop += 1) {
+          const below = bot.blockAt(vec3(bx + dx, by - drop, bz + dz));
+          if (isSolidBlock(below)) {
+            hasSafeLanding = true;
+            break;
+          }
+        }
+        if (!hasSafeLanding) {
+          steepDropSides += 1;
+        }
       }
     }
-    if (enclosedSides >= 3 && escapeStep && typeof bot.dig === "function" && !signal?.aborted) {
+    const blockedSides = enclosedSides + steepDropSides;
+    if (
+      (enclosedSides >= 3 || (blockedSides >= 3 && enclosedSides >= 1)) &&
+      escapeStep &&
+      typeof bot.dig === "function" &&
+      !signal?.aborted
+    ) {
       try {
         if (escapeStep.aboveHead && isNaturalFoliage(escapeStep.aboveHead.name)) {
           await bot.dig(escapeStep.aboveHead);
@@ -2284,10 +2286,10 @@ export class McRuntime {
       }
     }
 
-    // 3. If trapped in a stone/hard pit (3-4 sides solid, cannot carve barehanded),
+    // 3. If trapped in a stone/hard pit or cliff-backed crevice (cannot carve barehanded),
     // safely jump and place 1 filler block underfoot to step up (zero griefing).
     if (
-      enclosedSides >= 3 &&
+      (enclosedSides >= 3 || (blockedSides >= 3 && enclosedSides >= 2)) &&
       !signal?.aborted &&
       typeof bot.placeBlock === "function" &&
       typeof bot.equip === "function"
@@ -2332,20 +2334,68 @@ export class McRuntime {
     return false;
   }
 
-  async _gotoGoal(goal, signal) {
+  async _gotoGoal(goal, signal, moveOpts = {}) {
     const bot = this.bot;
     if (!bot?.pathfinder || typeof bot.pathfinder.goto !== "function") {
       throw new Error("pathfinder_unavailable");
     }
-    this._ensurePathfinder(bot);
+    const usesRelaxedMoves = Boolean(
+      moveOpts?.allowStepScaffold ||
+        (typeof moveOpts?.maxDropDown === "number" && moveOpts.maxDropDown > 3),
+    );
+    this._ensurePathfinder(bot, moveOpts);
+
+    // Work around mineflayer-pathfinder/lib/goto.js:23 resolving silently when
+    // `results.status === "noPath"` (or "timeout") and `results.path.length === 0`.
+    let noPathDetected = false;
+    let noPathReason = "";
+    const onPathUpdate = (results) => {
+      if (!results || typeof results !== "object") return;
+      const status = String(results.status || "");
+      const len = Array.isArray(results.path) ? results.path.length : -1;
+      if ((status === "noPath" || status === "timeout") && len === 0) {
+        const cur = bot.entity?.position;
+        let alreadyAtGoal = false;
+        if (cur && typeof goal?.isEnd === "function") {
+          try {
+            alreadyAtGoal = Boolean(
+              goal.isEnd({
+                x: Math.floor(cur.x ?? 0),
+                y: Math.floor(cur.y ?? 0),
+                z: Math.floor(cur.z ?? 0),
+              }),
+            );
+          } catch {
+            alreadyAtGoal = false;
+          }
+        }
+        if (!alreadyAtGoal) {
+          noPathDetected = true;
+          noPathReason = status === "timeout" ? "path_timeout" : "no_path";
+        }
+      }
+    };
+    bot.on?.("path_update", onPathUpdate);
 
     const checkMs = this.stuckCheckIntervalMs;
     const startPos = this._vecToTuple(bot.entity?.position);
     if (!checkMs || checkMs <= 0 || !startPos) {
-      await bot.pathfinder.goto(goal).catch((err) => {
-        if (signal?.aborted) return;
-        throw err;
-      });
+      try {
+        await bot.pathfinder.goto(goal).catch((err) => {
+          if (signal?.aborted) return;
+          throw err;
+        });
+        if (!signal?.aborted && noPathDetected) {
+          const err = new Error(noPathReason || "no_path");
+          err.code = "path_stuck";
+          throw err;
+        }
+      } finally {
+        bot.removeListener?.("path_update", onPathUpdate);
+        if (usesRelaxedMoves && this.bot === bot) {
+          this._ensurePathfinder(bot);
+        }
+      }
       return;
     }
 
@@ -2357,6 +2407,7 @@ export class McRuntime {
     let unsticking = false;
 
     const cleanup = () => {
+      bot.removeListener?.("path_update", onPathUpdate);
       if (stuckTimer) {
         clearInterval(stuckTimer);
         stuckTimer = null;
@@ -2445,8 +2496,16 @@ export class McRuntime {
 
     try {
       await Promise.race([gotoPromise, stuckPromise]);
+      if (!signal?.aborted && !markedStuck && noPathDetected) {
+        const err = new Error(noPathReason || "no_path");
+        err.code = "path_stuck";
+        throw err;
+      }
     } finally {
       cleanup();
+      if (usesRelaxedMoves && this.bot === bot) {
+        this._ensurePathfinder(bot);
+      }
     }
   }
 
@@ -2709,6 +2768,42 @@ export class McRuntime {
           block: lastBlockName,
           pos: lastCoords,
         };
+      }
+      // Verify actual survival mining reach before digging; prevents ghost out-of-reach digs
+      // when pathfinder resolves early without moving close enough to the target block.
+      const curBotPos = bot.entity?.position;
+      if (curBotPos) {
+        const reachDist = Math.hypot(
+          Math.floor(chosenCoords[0]) + 0.5 - (curBotPos.x ?? 0),
+          Math.floor(chosenCoords[1]) + 0.5 - ((curBotPos.y ?? 0) + 1.62),
+          Math.floor(chosenCoords[2]) + 0.5 - (curBotPos.z ?? 0),
+        );
+        if (Number.isFinite(reachDist) && reachDist > 5.8) {
+          stuckSkips += 1;
+          this._unreachableBlocks.markColumn(chosenCoords, { nowMs: this.nowFn() });
+          const cx = Math.floor(chosenCoords[0]);
+          const cy = Math.floor(chosenCoords[1]);
+          const cz = Math.floor(chosenCoords[2]);
+          for (let dy = -2; dy <= 3; dy += 1) {
+            visitedKeys.add(`${cx},${cy + dy},${cz}`);
+          }
+          if (stuckSkips < 3) {
+            step -= 1;
+            continue;
+          }
+          if (collectedCount === 0) {
+            return {
+              ok: false,
+              stuck: true,
+              reason: "path_stuck",
+              collected_count: 0,
+              block: lastBlockName,
+              pos: lastCoords,
+              blacklisted_skipped: blacklistedSkipped,
+            };
+          }
+          break;
+        }
       }
       if (chosenBlock && this.config.mcAutoEquip !== false && !this._eatingLock.eating) {
         await equipBestHarvestTool(bot, chosenBlock);
@@ -3182,14 +3277,44 @@ export class McRuntime {
       }
       this.activity = `前往(${Math.round(coords.x)},${Math.round(coords.y)},${Math.round(coords.z)})`;
       this._emitSnapshot();
+      const startPos = this._vecToTuple(bot.entity?.position);
+      const isNearDest = () => {
+        const p = this._vecToTuple(bot.entity?.position);
+        if (!p) return true;
+        return Math.hypot(p[0] - coords.x, p[1] - coords.y, p[2] - coords.z) <= 4.5;
+      };
+      const movedEnough = () => {
+        const p = this._vecToTuple(bot.entity?.position);
+        if (!p || !startPos) return true;
+        return Math.hypot(p[0] - startPos[0], p[1] - startPos[1], p[2] - startPos[2]) >= 1.5;
+      };
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
+        const goal = new GoalNear(coords.x, coords.y, coords.z, 1);
+        let firstFailed = false;
         try {
-          await this._gotoGoal(new GoalNear(coords.x, coords.y, coords.z, 1), signal);
-          return { ok: true };
+          await this._gotoGoal(goal, signal);
         } catch {
           if (signal.aborted) return { aborted: true };
-          return { stuck: true };
+          firstFailed = true;
         }
+        if (signal.aborted) return { aborted: true };
+        if (!firstFailed && (isNearDest() || movedEnough())) {
+          return { ok: true };
+        }
+        await this._tryNaturalUnstick(bot, signal).catch(() => false);
+        if (signal.aborted) return { aborted: true };
+        const fallbackMoveOpts = {
+          maxDropDown: this.health === null || this.health >= 8 ? 4 : 3,
+          allowStepScaffold: true,
+        };
+        try {
+          await this._gotoGoal(goal, signal, fallbackMoveOpts);
+        } catch {
+          if (signal.aborted) return { aborted: true };
+          return isNearDest() || movedEnough() ? { ok: true } : { stuck: true };
+        }
+        if (signal.aborted) return { aborted: true };
+        return isNearDest() || movedEnough() ? { ok: true } : { stuck: true };
       });
       this._refreshFromBot();
       if (outcome?.stuck || outcome?.timedOut || outcome?.aborted) {
@@ -3260,8 +3385,15 @@ export class McRuntime {
           targetZ =
             cand.tz !== undefined ? cand.tz : Math.round(curNow[2] + Math.sin(cand.angle) * cand.r);
           this.activity = `${cand.label}(${targetX},${targetZ})`;
+          const moveOpts =
+            attempt >= 1
+              ? {
+                  maxDropDown: this.health === null || this.health >= 8 ? 4 : 3,
+                  allowStepScaffold: true,
+                }
+              : {};
           try {
-            await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal);
+            await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal, moveOpts);
             if (signal.aborted) return { aborted: true };
             const endNow = this._vecToTuple(bot.entity?.position) || curNow;
             const movedTotal = Math.hypot(endNow[0] - startPos[0], endNow[2] - startPos[2]);

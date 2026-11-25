@@ -316,6 +316,7 @@ test("P1: UnreachableBlockBlacklist skips stubborn blocks across turns and expir
       err.code = "path_stuck";
       throw err;
     }
+    bot.entity.position = vec3(goal.x, goal.y, goal.z);
   };
 
   const rt = new McRuntime({
@@ -451,7 +452,19 @@ test("P1: environmental hazard detection spots lava/fire and low oxygen", () => 
   assert.equal(h1.hazard, "hazard_fire");
   assert.equal(h1.severity, 3);
 
-  const waterBot = makeRichCraftBot();
+  // Dry-land bot with polluted oxygenLevel (upstream mineflayer 4.39.0 entities.js bug) must NOT trigger hazard_water
+  const dryLandBot = makeRichCraftBot();
+  dryLandBot.oxygenLevel = 4;
+  const hDry = detectEnvironmentalHazard(dryLandBot);
+  assert.equal(hDry.hazard, "");
+
+  // Submerged bot with low oxygen DOES trigger hazard_water
+  const waterBot = makeRichCraftBot({
+    blocks: new Map([
+      ["0,64,0", { name: "water", boundingBox: "empty" }],
+      ["0,65,0", { name: "water", boundingBox: "empty" }],
+    ]),
+  });
   waterBot.oxygenLevel = 4;
   const h2 = detectEnvironmentalHazard(waterBot);
   assert.equal(h2.hazard, "hazard_water");
@@ -781,4 +794,132 @@ test("live-log fixes: unreachable remote crafting_table falls back locally, expl
   stuckExpRt.stop();
   pitRt.stop();
   enderRt.stop();
+});
+
+test("v2.9.8 live-log fixes: intercept noPath empty-path resolve, enforce dig reach, guard acquire null reason, and steep-terrain unstick fallback", async () => {
+  // 1. mineflayer-pathfinder silent noPath (path.length === 0) is rejected by _gotoGoal;
+  //    goto falls back to steep-terrain movements and never falsely succeeds when stationary.
+  const noPathBot = makeRichCraftBot({ pos: vec3(5.5, 76, -2.5), blocks: new Map() });
+  const seenMoves = [];
+  noPathBot.pathfinder.setMovements = (m) => seenMoves.push({ ...m });
+  noPathBot.pathfinder.goto = async () => {
+    noPathBot.emit("path_update", { status: "noPath", path: [] });
+  };
+  const noPathRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => noPathBot,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  noPathRt.connectBot();
+  noPathBot.emit("spawn");
+
+  const gotoFail = await noPathRt.dispatchGoal({ action_type: "goto", x: 8, y: 71, z: 9 });
+  assert.equal(gotoFail.ok, false);
+  assert.equal(gotoFail.reason, "path_stuck");
+  assert.ok(seenMoves.some((m) => m.maxDropDown === 4 && m.allow1by1towers === true && m.canDig === false));
+  // Restored strict defaults after fallback
+  const lastMoveAfterGoto = seenMoves[seenMoves.length - 1];
+  assert.equal(lastMoveAfterGoto.maxDropDown, 3);
+  assert.equal(lastMoveAfterGoto.allow1by1towers, false);
+  assert.equal(lastMoveAfterGoto.canDig, false);
+
+  // 2. gather refuses to ghost-dig an out-of-reach tree (20 blocks away) when pathfinder doesn't reach it
+  const farTreeBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    blocks: new Map([["20,64,0", { name: "oak_log", boundingBox: "block" }]]),
+  });
+  farTreeBot.pathfinder.goto = async () => {
+    // Resolves without moving bot close to (20, 64, 0)
+  };
+  const farTreeRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => farTreeBot,
+    stuckCheckIntervalMs: 0,
+    pickupSettleMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  farTreeRt.connectBot();
+  farTreeBot.emit("spawn");
+
+  const ghostGather = await farTreeRt.dispatchGoal({
+    action_type: "gather",
+    block_type: "oak_log",
+    count: 2,
+  });
+  assert.equal(ghostGather.ok, false);
+  assert.equal(farTreeBot._dug.length, 0);
+  assert.equal(farTreeRt._unreachableBlocks.has([20, 64, 0], farTreeRt.nowFn()), true);
+
+  // 3. acquire ensureWoodPlanks never throws TypeError on g.reason when gather reports ok without adding logs
+  const ghostAcqBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    initialItems: [
+      { name: "stick", count: 4 },
+      { name: "birch_planks", count: 2 },
+      { name: "oak_planks", count: 1 },
+      { name: "crafting_table", count: 1 },
+    ],
+    blocks: new Map([["18,64,0", { name: "oak_log", boundingBox: "block" }]]),
+  });
+  let gatherInvocations = 0;
+  const ghostAcqRes = await executeAcquireAction(
+    ghostAcqBot,
+    { item_name: "wooden_pickaxe", count: 1 },
+    {
+      gatherBlocksFn: async () => {
+        gatherInvocations += 1;
+        return { ok: true, collected_count: 1, block: "oak_log" };
+      },
+    },
+  );
+  assert.equal(ghostAcqRes.ok, false);
+  assert.equal(ghostAcqRes.reason, "missing_materials");
+  assert.ok(gatherInvocations <= 3);
+
+  // 4. explore triggers safe steep-terrain fallback (maxDropDown=4, allowStepScaffold=true, canDig=false)
+  //    on attempt 1 after attempt 0 hits noPath, escapes 7 blocks, and restores strict defaults.
+  const cliffBot = makeRichCraftBot({
+    pos: vec3(5.5, 76, -2.5),
+    initialItems: [{ name: "dirt", count: 30 }],
+    blocks: new Map(),
+  });
+  const cliffMoves = [];
+  let curMoveMode = null;
+  cliffBot.pathfinder.setMovements = (m) => {
+    curMoveMode = { ...m };
+    cliffMoves.push(curMoveMode);
+  };
+  cliffBot.pathfinder.goto = async () => {
+    if (!curMoveMode?.allow1by1towers) {
+      cliffBot.emit("path_update", { status: "noPath", path: [] });
+      return;
+    }
+    cliffBot.entity.position = vec3(12.5, 72, -2.5);
+  };
+  const cliffRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => cliffBot,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  cliffRt.connectBot();
+  cliffBot.emit("spawn");
+
+  const escRes = await cliffRt.dispatchGoal({ action_type: "explore" });
+  assert.equal(escRes.ok, true);
+  assert.equal(escRes.moved_blocks, 7);
+  assert.ok(cliffMoves.some((m) => m.maxDropDown === 4 && m.allow1by1towers === true && m.canDig === false));
+  assert.equal(cliffMoves[cliffMoves.length - 1].maxDropDown, 3);
+  assert.equal(cliffMoves[cliffMoves.length - 1].allow1by1towers, false);
+
+  noPathRt.stop();
+  farTreeRt.stop();
+  cliffRt.stop();
 });

@@ -454,6 +454,7 @@ export async function executeAcquireAction(
     // Try gathering a single consistent species first to avoid split-species planks.
     for (const singleLog of logOrder.slice(0, 3)) {
       if (!hasAnyNearbyBlock(bot, [singleLog], 32)) continue;
+      const beforePotential = computeWoodInventory(countInventoryByName(bot)).totalPotentialPlanks;
       const g = await runGather([singleLog], logsNeeded, singleLog);
       if (g.ok) {
         const afterWood = computeWoodInventory(countInventoryByName(bot));
@@ -463,6 +464,9 @@ export async function executeAcquireAction(
         ) {
           return { ok: true };
         }
+        if (afterWood.totalPotentialPlanks <= beforePotential) {
+          continue;
+        }
         if (depth < ctx.maxDepth - 1) {
           return await ensureWoodPlanks(
             totalPlanksRequired,
@@ -470,8 +474,10 @@ export async function executeAcquireAction(
             depth + 1,
           );
         }
+        continue;
       }
-      if (g.reason === "mc_goal_cancelled" || g.reason.startsWith("interrupted_")) {
+      const gReason = typeof g.reason === "string" ? g.reason : "";
+      if (gReason === "mc_goal_cancelled" || gReason.startsWith("interrupted_")) {
         return g;
       }
     }

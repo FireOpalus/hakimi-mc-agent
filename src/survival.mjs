@@ -1055,14 +1055,19 @@ export function detectEnvironmentalHazard(bot) {
     return { hazard: "hazard_fire", detail: inFireBlock ? "fire_block" : "on_fire", severity: 2 };
   }
 
-  const headInWater = headName === "water" || headName === "flowing_water";
+  const feetInWater =
+    feetName === "water" || feetName === "flowing_water" || feetName === "bubble_column";
+  const headInWater =
+    headName === "water" || headName === "flowing_water" || headName === "bubble_column";
+  const isInWater = headInWater || feetInWater || Boolean(bot.entity?.isInWater);
   const oxygen =
     typeof bot.oxygenLevel === "number" && Number.isFinite(bot.oxygenLevel)
       ? bot.oxygenLevel
       : null;
   if (
-    (oxygen !== null && oxygen <= 6) ||
-    (headInWater && oxygen !== null && oxygen <= 10)
+    isInWater &&
+    ((headInWater && oxygen !== null && oxygen <= 10) ||
+      (oxygen !== null && oxygen <= 6))
   ) {
     return { hazard: "hazard_water", detail: "low_oxygen", severity: 2 };
   }
