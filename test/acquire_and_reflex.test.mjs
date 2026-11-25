@@ -819,9 +819,20 @@ test("v2.9.8 live-log fixes: intercept noPath empty-path resolve, enforce dig re
   const gotoFail = await noPathRt.dispatchGoal({ action_type: "goto", x: 8, y: 71, z: 9 });
   assert.equal(gotoFail.ok, false);
   assert.equal(gotoFail.reason, "path_stuck");
-  assert.ok(seenMoves.some((m) => m.maxDropDown === 4 && m.allow1by1towers === true && m.canDig === false));
-  // Restored strict defaults after fallback
+  assert.ok(
+    seenMoves.some(
+      (m) =>
+        m.profileName === "natural_traverse" &&
+        m.maxDropDown === 4 &&
+        m.allow1by1towers === true &&
+        m.canDig === true &&
+        Array.isArray(m.exclusionAreasBreak) &&
+        m.exclusionAreasBreak.length >= 1,
+    ),
+  );
+  // Restored strict cruise_walk defaults after escalation
   const lastMoveAfterGoto = seenMoves[seenMoves.length - 1];
+  assert.equal(lastMoveAfterGoto.profileName, "cruise_walk");
   assert.equal(lastMoveAfterGoto.maxDropDown, 3);
   assert.equal(lastMoveAfterGoto.allow1by1towers, false);
   assert.equal(lastMoveAfterGoto.canDig, false);
@@ -915,7 +926,16 @@ test("v2.9.8 live-log fixes: intercept noPath empty-path resolve, enforce dig re
   const escRes = await cliffRt.dispatchGoal({ action_type: "explore" });
   assert.equal(escRes.ok, true);
   assert.equal(escRes.moved_blocks, 7);
-  assert.ok(cliffMoves.some((m) => m.maxDropDown === 4 && m.allow1by1towers === true && m.canDig === false));
+  assert.ok(
+    cliffMoves.some(
+      (m) =>
+        m.profileName === "natural_traverse" &&
+        m.maxDropDown === 4 &&
+        m.allow1by1towers === true &&
+        m.canDig === true,
+    ),
+  );
+  assert.equal(cliffMoves[cliffMoves.length - 1].profileName, "cruise_walk");
   assert.equal(cliffMoves[cliffMoves.length - 1].maxDropDown, 3);
   assert.equal(cliffMoves[cliffMoves.length - 1].allow1by1towers, false);
 

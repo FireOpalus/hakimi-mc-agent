@@ -2,6 +2,11 @@ import vec3 from "vec3";
 import pathfinderPkg from "mineflayer-pathfinder";
 import { normalizeCanonicalItemId, normalizePlayerId } from "./protocol.mjs";
 import {
+  MOVEMENT_PROFILES,
+  SAFE_SCAFFOLD_BLOCKS,
+  applyMovementProfile,
+} from "./navigation.mjs";
+import {
   extractCanonicalItemName,
   equipBestHarvestTool,
   equipBestWeapon,
@@ -12,7 +17,7 @@ import {
   isSafeFoodItem,
 } from "./survival.mjs";
 
-const { Movements, goals } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 const { GoalNear } = goals;
 
 export const MIN_HUNT_COUNT = 1;
@@ -268,90 +273,24 @@ export function isSafePlaceableBlock(itemName) {
   return SAFE_PLACEABLE_BLOCKS.has(clean) || isBedName(clean);
 }
 
-export const SAFE_UNSTICK_SCAFFOLD_BLOCKS = new Set([
-  "dirt",
-  "coarse_dirt",
-  "cobblestone",
-  "cobbled_deepslate",
-  "oak_planks",
-  "birch_planks",
-  "spruce_planks",
-  "jungle_planks",
-  "acacia_planks",
-  "dark_oak_planks",
-  "mangrove_planks",
-  "cherry_planks",
-  "pale_oak_planks",
-  "netherrack",
-  "sandstone",
-  "andesite",
-  "diorite",
-  "granite",
-  "tuff",
-]);
+export const SAFE_UNSTICK_SCAFFOLD_BLOCKS = SAFE_SCAFFOLD_BLOCKS;
 
 /**
- * Configure pathfinder Movements safely so normal navigation never griefs
- * player bases (`canDig=false`, `allow1by1towers=false`, empty scaffolding).
- * When `allowStepScaffold=true` (bounded unstick fallback only), allows placing
- * natural filler blocks to climb out of cliffs/pits while keeping `canDig=false`.
+ * Configure pathfinder Movements safely. Delegates to `navigation.mjs` profiles:
+ * - Default (`cruise_walk`): `canDig=false`, `allow1by1towers=false`, empty scaffolding.
+ * - Explicit `profile` or `{ allowDig, maxDropDown, allowStepScaffold }` forwards cleanly.
  */
 export function applySafeMovements(
   bot,
-  { allowDig = false, maxDropDown = 3, allowStepScaffold = false } = {},
+  { profile = null, allowDig = false, maxDropDown = 3, allowStepScaffold = false, health = null } = {},
 ) {
-  if (!bot) return null;
-  if (!bot.pathfinder && typeof bot.loadPlugin === "function" && bot.registry?.blocksByName) {
-    bot.loadPlugin(pathfinderPkg.pathfinder);
-  }
-  if (!bot.pathfinder || typeof bot.pathfinder.setMovements !== "function") return null;
-  const safeDrop =
-    typeof maxDropDown === "number" && Number.isFinite(maxDropDown)
-      ? Math.max(3, Math.min(4, Math.floor(maxDropDown)))
-      : 3;
-  const scaffoldIds = [];
-  if (allowStepScaffold && bot.registry?.itemsByName) {
-    for (const name of SAFE_UNSTICK_SCAFFOLD_BLOCKS) {
-      const itemDef = bot.registry.itemsByName[name];
-      if (itemDef && typeof itemDef.id === "number") {
-        scaffoldIds.push(itemDef.id);
-      }
-    }
-  }
-  if (bot.registry?.blocksByName) {
-    try {
-      const movements = new Movements(bot);
-      movements.canDig = Boolean(allowDig);
-      movements.allow1by1towers = Boolean(allowStepScaffold);
-      movements.canPlaceOn = Boolean(allowDig || allowStepScaffold);
-      if ("allowSprinting" in movements) movements.allowSprinting = true;
-      if ("allowParkour" in movements) movements.allowParkour = true;
-      if ("maxDropDown" in movements) movements.maxDropDown = safeDrop;
-      if ("canOpenDoors" in movements) movements.canOpenDoors = true;
-      if ("dontMineUnderFallingBlock" in movements) movements.dontMineUnderFallingBlock = true;
-      if (!allowDig && Array.isArray(movements.scafoldingBlocks)) {
-        movements.scafoldingBlocks = allowStepScaffold ? scaffoldIds : [];
-      }
-      bot.pathfinder.setMovements(movements);
-      return movements;
-    } catch {
-      // Fall through to lightweight safe movements object on partial registries
-    }
-  }
-  const safeMovements = {
-    canDig: Boolean(allowDig),
-    allow1by1towers: Boolean(allowStepScaffold),
-    canPlaceOn: Boolean(allowDig || allowStepScaffold),
-    maxDropDown: safeDrop,
-    canOpenDoors: true,
-    scafoldingBlocks: allowStepScaffold
-      ? scaffoldIds.length > 0
-        ? scaffoldIds
-        : ["dirt", "cobblestone"]
-      : [],
-  };
-  bot.pathfinder.setMovements(safeMovements);
-  return safeMovements;
+  const chosenProfile = profile || MOVEMENT_PROFILES.CRUISE_WALK;
+  return applyMovementProfile(bot, chosenProfile, {
+    allowDig,
+    maxDropDown,
+    allowStepScaffold,
+    health,
+  });
 }
 
 /**

@@ -1,5 +1,6 @@
 import pathfinderPkg from "mineflayer-pathfinder";
 import { normalizeCanonicalItemId } from "./protocol.mjs";
+import { MOVEMENT_PROFILES, applyMovementProfile } from "./navigation.mjs";
 import {
   collectEquipmentSnapshot,
   equipBestWeapon,
@@ -7,7 +8,7 @@ import {
   getWeaponAttackCooldownMs,
 } from "./survival.mjs";
 
-const { Movements, goals } = pathfinderPkg;
+const { goals } = pathfinderPkg;
 const { GoalFollow, GoalNearXZ } = goals;
 
 export const HOSTILE_MOBS = new Set([
@@ -207,34 +208,7 @@ export function classifyCombatEntity(entity, bot = null) {
 }
 
 export function applyNoDigMovements(bot) {
-  if (!bot) return null;
-  if (!bot.pathfinder && typeof bot.loadPlugin === "function" && bot.registry?.blocksByName) {
-    bot.loadPlugin(pathfinderPkg.pathfinder);
-  }
-  if (!bot.pathfinder || typeof bot.pathfinder.setMovements !== "function") return null;
-  if (bot.registry?.blocksByName) {
-    try {
-      const movements = new Movements(bot);
-      movements.canDig = false;
-      movements.allow1by1towers = false;
-      movements.canPlaceOn = false;
-      if (Array.isArray(movements.scafoldingBlocks)) {
-        movements.scafoldingBlocks = [];
-      }
-      bot.pathfinder.setMovements(movements);
-      return movements;
-    } catch {
-      // Fall through to lightweight no-dig movements object on partial registries
-    }
-  }
-  const safeMovements = {
-    canDig: false,
-    allow1by1towers: false,
-    canPlaceOn: false,
-    scafoldingBlocks: [],
-  };
-  bot.pathfinder.setMovements(safeMovements);
-  return safeMovements;
+  return applyMovementProfile(bot, MOVEMENT_PROFILES.COMBAT_NODIG);
 }
 
 export function hasShieldEquipped(bot) {

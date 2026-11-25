@@ -35,6 +35,14 @@ import { executeCraftAction, parseCraftParams } from "./crafting.mjs";
 import { executeSmeltAction, parseSmeltParams } from "./smelting.mjs";
 import { executeAcquireAction, parseAcquireParams } from "./acquire.mjs";
 import {
+  MOVEMENT_PROFILES,
+  clearBotControlStates,
+  isNaturalFoliageBlock,
+  isNaturalSoftBlock,
+  isNearPlayerStructure,
+  navigateToGoal,
+} from "./navigation.mjs";
+import {
   SAFE_UNSTICK_SCAFFOLD_BLOCKS,
   applySafeMovements,
   checkHarvestToolTier,
@@ -2137,6 +2145,7 @@ export class McRuntime {
       } catch {
         // Ignore pathfinder stop errors
       }
+      clearBotControlStates(this.bot);
     };
     this.activeTask = actionType;
     this._activeGoalCancel = cancel;
@@ -2182,26 +2191,6 @@ export class McRuntime {
     const by = Math.floor(pos.y);
     const bz = Math.floor(pos.z);
 
-    const isNaturalFoliage = (name) =>
-      typeof name === "string" &&
-      (name.endsWith("_leaves") ||
-        name === "vine" ||
-        name === "tall_grass" ||
-        name === "large_fern" ||
-        name === "bush" ||
-        name === "snow");
-    const naturalPitBlocks = new Set([
-      "dirt",
-      "grass_block",
-      "coarse_dirt",
-      "podzol",
-      "rooted_dirt",
-      "mud",
-      "sand",
-      "red_sand",
-      "gravel",
-      "clay",
-    ]);
     const safePillarBlocks = SAFE_UNSTICK_SCAFFOLD_BLOCKS;
 
     const cardinal = [
@@ -2222,7 +2211,7 @@ export class McRuntime {
       for (const [fx, fy, fz] of foliageCoords) {
         if (dug >= 2 || signal?.aborted) break;
         const blk = bot.blockAt(vec3(fx, fy, fz));
-        if (blk && isNaturalFoliage(blk.name)) {
+        if (blk && isNaturalFoliageBlock(blk.name) && !isNearPlayerStructure(bot, blk.position)) {
           try {
             await bot.dig(blk);
             dug += 1;
@@ -2234,27 +2223,39 @@ export class McRuntime {
     }
     if (dug > 0) return true;
 
-    // 2. If trapped inside a natural 2-deep hole/creeper crater or cliff-backed stone pocket,
-    // carve 1 natural dirt/grass step at head height so the bot can walk out.
+    // 2. Inspect surrounding geometry: 2-deep pits, 1-high low-ceiling crawlspaces, or cliff pockets.
     const isSolidBlock = (blk) => Boolean(blk && blk.boundingBox !== "empty" && blk.name !== "air");
+    const canDigNatural = (blk) =>
+      Boolean(blk && isNaturalSoftBlock(blk.name) && !isNearPlayerStructure(bot, blk.position));
     let enclosedSides = 0;
+    let headBlockedSides = 0;
     let steepDropSides = 0;
     let escapeStep = null;
+    let lowCeilingStep = null;
     for (const [dx, dz] of cardinal) {
       const footSide = bot.blockAt(vec3(bx + dx, by, bz + dz));
       const headSide = bot.blockAt(vec3(bx + dx, by + 1, bz + dz));
       const aboveHead = bot.blockAt(vec3(bx + dx, by + 2, bz + dz));
       const footSolid = isSolidBlock(footSide);
       const headSolid = isSolidBlock(headSide);
+      if (headSolid) {
+        headBlockedSides += 1;
+      }
       if (footSolid && headSolid) {
         enclosedSides += 1;
         const aboveClear =
-          !aboveHead || aboveHead.boundingBox === "empty" || aboveHead.name === "air" || isNaturalFoliage(aboveHead.name);
-        if (!escapeStep && naturalPitBlocks.has(headSide.name) && aboveClear) {
+          !aboveHead ||
+          aboveHead.boundingBox === "empty" ||
+          aboveHead.name === "air" ||
+          isNaturalFoliageBlock(aboveHead.name);
+        if (!escapeStep && canDigNatural(headSide) && aboveClear) {
           escapeStep = { headSide, aboveHead };
         }
+      } else if (!footSolid && headSolid) {
+        if (!lowCeilingStep && canDigNatural(headSide)) {
+          lowCeilingStep = headSide;
+        }
       } else if (!footSolid && !headSolid) {
-        // Check whether stepping this way leads into a >= 4-block drop (blocked by maxDropDown=3).
         let hasSafeLanding = false;
         for (let drop = 1; drop <= 4; drop += 1) {
           const below = bot.blockAt(vec3(bx + dx, by - drop, bz + dz));
@@ -2268,6 +2269,35 @@ export class McRuntime {
         }
       }
     }
+
+    // 2a. 1-high natural dirt/grass crawlspace (head blocked on all 4 sides, foot open on at least 1):
+    // open a 2-high natural doorway or skylight cap (never touches player builds).
+    if (headBlockedSides >= 4 && typeof bot.dig === "function" && !signal?.aborted) {
+      if (lowCeilingStep) {
+        try {
+          await bot.dig(lowCeilingStep);
+          return true;
+        } catch {
+          // Fall through to skylight check
+        }
+      }
+      const ceilingBlk = bot.blockAt(vec3(bx, by + 2, bz));
+      const skyAbove = bot.blockAt(vec3(bx, by + 3, bz));
+      const skyClear =
+        !skyAbove ||
+        skyAbove.boundingBox === "empty" ||
+        skyAbove.name === "air" ||
+        isNaturalFoliageBlock(skyAbove.name);
+      if (canDigNatural(ceilingBlk) && skyClear) {
+        try {
+          await bot.dig(ceilingBlk);
+          return true;
+        } catch {
+          // Best-effort skylight clear
+        }
+      }
+    }
+
     const blockedSides = enclosedSides + steepDropSides;
     if (
       (enclosedSides >= 3 || (blockedSides >= 3 && enclosedSides >= 1)) &&
@@ -2276,7 +2306,11 @@ export class McRuntime {
       !signal?.aborted
     ) {
       try {
-        if (escapeStep.aboveHead && isNaturalFoliage(escapeStep.aboveHead.name)) {
+        if (
+          escapeStep.aboveHead &&
+          isNaturalFoliageBlock(escapeStep.aboveHead.name) &&
+          !isNearPlayerStructure(bot, escapeStep.aboveHead.position)
+        ) {
           await bot.dig(escapeStep.aboveHead);
         }
         await bot.dig(escapeStep.headSide);
@@ -2334,179 +2368,35 @@ export class McRuntime {
     return false;
   }
 
-  async _gotoGoal(goal, signal, moveOpts = {}) {
+  async _gotoGoal(goal, signal, navOpts = {}) {
     const bot = this.bot;
-    if (!bot?.pathfinder || typeof bot.pathfinder.goto !== "function") {
+    if (!bot?.pathfinder) {
       throw new Error("pathfinder_unavailable");
     }
-    const usesRelaxedMoves = Boolean(
-      moveOpts?.allowStepScaffold ||
-        (typeof moveOpts?.maxDropDown === "number" && moveOpts.maxDropDown > 3),
-    );
-    this._ensurePathfinder(bot, moveOpts);
-
-    // Work around mineflayer-pathfinder/lib/goto.js:23 resolving silently when
-    // `results.status === "noPath"` (or "timeout") and `results.path.length === 0`.
-    let noPathDetected = false;
-    let noPathReason = "";
-    const onPathUpdate = (results) => {
-      if (!results || typeof results !== "object") return;
-      const status = String(results.status || "");
-      const len = Array.isArray(results.path) ? results.path.length : -1;
-      if ((status === "noPath" || status === "timeout") && len === 0) {
-        const cur = bot.entity?.position;
-        let alreadyAtGoal = false;
-        if (cur && typeof goal?.isEnd === "function") {
-          try {
-            alreadyAtGoal = Boolean(
-              goal.isEnd({
-                x: Math.floor(cur.x ?? 0),
-                y: Math.floor(cur.y ?? 0),
-                z: Math.floor(cur.z ?? 0),
-              }),
-            );
-          } catch {
-            alreadyAtGoal = false;
-          }
-        }
-        if (!alreadyAtGoal) {
-          noPathDetected = true;
-          noPathReason = status === "timeout" ? "path_timeout" : "no_path";
-        }
-      }
-    };
-    bot.on?.("path_update", onPathUpdate);
-
-    const checkMs = this.stuckCheckIntervalMs;
-    const startPos = this._vecToTuple(bot.entity?.position);
-    if (!checkMs || checkMs <= 0 || !startPos) {
-      try {
-        await bot.pathfinder.goto(goal).catch((err) => {
-          if (signal?.aborted) return;
-          throw err;
-        });
-        if (!signal?.aborted && noPathDetected) {
-          const err = new Error(noPathReason || "no_path");
-          err.code = "path_stuck";
-          throw err;
-        }
-      } finally {
-        bot.removeListener?.("path_update", onPathUpdate);
-        if (usesRelaxedMoves && this.bot === bot) {
-          this._ensurePathfinder(bot);
-        }
-      }
-      return;
+    const res = await navigateToGoal(bot, goal, {
+      signal,
+      startProfile: navOpts.startProfile || MOVEMENT_PROFILES.CRUISE_WALK,
+      escalate: navOpts.escalate !== false,
+      escalateOnStuck: navOpts.escalateOnStuck !== false,
+      allowRockEscape: navOpts.allowRockEscape !== false,
+      profileOpts: {
+        health: this.health,
+        ...(navOpts.profileOpts || {}),
+      },
+      stuckCheckIntervalMs: this.stuckCheckIntervalMs,
+      onStuckStrike: (b, sig) => this._tryNaturalUnstick(b, sig),
+      restoreDefaultAfter: true,
+    });
+    if (res.aborted || signal?.aborted) {
+      return res;
     }
-
-    let stuckTimer = null;
-    let jumpTimer = null;
-    let lastPos = startPos;
-    let stuckStrikes = 0;
-    let markedStuck = false;
-    let unsticking = false;
-
-    const cleanup = () => {
-      bot.removeListener?.("path_update", onPathUpdate);
-      if (stuckTimer) {
-        clearInterval(stuckTimer);
-        stuckTimer = null;
-      }
-      if (jumpTimer) {
-        clearTimeout(jumpTimer);
-        jumpTimer = null;
-      }
-      try {
-        bot.setControlState?.("jump", false);
-      } catch {
-        // Ignore control reset errors
-      }
-    };
-
-    const triggerJump = (ms = 220) => {
-      try {
-        bot.setControlState?.("jump", true);
-        if (jumpTimer) clearTimeout(jumpTimer);
-        jumpTimer = setTimeout(() => {
-          jumpTimer = null;
-          try {
-            bot.setControlState?.("jump", false);
-          } catch {
-            // Ignore jump release errors
-          }
-        }, ms);
-      } catch {
-        // Ignore jump trigger errors
-      }
-    };
-
-    const gotoPromise = Promise.resolve(bot.pathfinder.goto(goal)).catch((err) => {
-      if (signal?.aborted || markedStuck) return;
+    if (!res.ok) {
+      const err = new Error(res.reason || "path_stuck");
+      err.code = "path_stuck";
+      err.navReason = res.reason || "path_stuck";
       throw err;
-    });
-
-    const stuckPromise = new Promise((_, reject) => {
-      stuckTimer = setInterval(() => {
-        if (signal?.aborted || unsticking) {
-          if (signal?.aborted) cleanup();
-          return;
-        }
-        const curPos = this._vecToTuple(bot.entity?.position);
-        if (!curPos) return;
-        const moved = Math.hypot(
-          curPos[0] - lastPos[0],
-          curPos[1] - lastPos[1],
-          curPos[2] - lastPos[2],
-        );
-        lastPos = curPos;
-        if (moved >= 0.35) {
-          stuckStrikes = 0;
-          return;
-        }
-        stuckStrikes += 1;
-        if (stuckStrikes === 1) {
-          triggerJump(220);
-          return;
-        }
-        if (stuckStrikes === 2) {
-          unsticking = true;
-          void this._tryNaturalUnstick(bot, signal)
-            .catch(() => false)
-            .finally(() => {
-              unsticking = false;
-              if (!signal?.aborted && !markedStuck) {
-                triggerJump(250);
-              }
-            });
-          return;
-        }
-        markedStuck = true;
-        cleanup();
-        try {
-          bot.pathfinder?.stop?.();
-          bot.pathfinder?.setGoal?.(null);
-        } catch {
-          // Ignore pathfinder stop errors
-        }
-        const err = new Error("path_stuck");
-        err.code = "path_stuck";
-        reject(err);
-      }, checkMs);
-    });
-
-    try {
-      await Promise.race([gotoPromise, stuckPromise]);
-      if (!signal?.aborted && !markedStuck && noPathDetected) {
-        const err = new Error(noPathReason || "no_path");
-        err.code = "path_stuck";
-        throw err;
-      }
-    } finally {
-      cleanup();
-      if (usesRelaxedMoves && this.bot === bot) {
-        this._ensurePathfinder(bot);
-      }
     }
+    return res;
   }
 
   _findNearestDroppedItem(bot, centerCoords, maxDist = 5) {
@@ -2722,6 +2612,7 @@ export class McRuntime {
           await this._gotoGoal(
             new GoalNear(chosenCoords[0], chosenCoords[1], chosenCoords[2], 3),
             signal,
+            { escalateOnStuck: false },
           );
         } catch {
           if (signal?.aborted) {
@@ -3083,6 +2974,7 @@ export class McRuntime {
       } catch {
         // Ignore stop errors
       }
+      clearBotControlStates(this.bot);
       this.activity = this.connected ? "原地待命" : "待机";
       this._emitSnapshot();
       return {
@@ -3303,12 +3195,10 @@ export class McRuntime {
         }
         await this._tryNaturalUnstick(bot, signal).catch(() => false);
         if (signal.aborted) return { aborted: true };
-        const fallbackMoveOpts = {
-          maxDropDown: this.health === null || this.health >= 8 ? 4 : 3,
-          allowStepScaffold: true,
-        };
         try {
-          await this._gotoGoal(goal, signal, fallbackMoveOpts);
+          await this._gotoGoal(goal, signal, {
+            startProfile: MOVEMENT_PROFILES.NATURAL_TRAVERSE,
+          });
         } catch {
           if (signal.aborted) return { aborted: true };
           return isNearDest() || movedEnough() ? { ok: true } : { stuck: true };
@@ -3385,15 +3275,12 @@ export class McRuntime {
           targetZ =
             cand.tz !== undefined ? cand.tz : Math.round(curNow[2] + Math.sin(cand.angle) * cand.r);
           this.activity = `${cand.label}(${targetX},${targetZ})`;
-          const moveOpts =
+          const navOpts =
             attempt >= 1
-              ? {
-                  maxDropDown: this.health === null || this.health >= 8 ? 4 : 3,
-                  allowStepScaffold: true,
-                }
+              ? { startProfile: MOVEMENT_PROFILES.NATURAL_TRAVERSE }
               : {};
           try {
-            await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal, moveOpts);
+            await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal, navOpts);
             if (signal.aborted) return { aborted: true };
             const endNow = this._vecToTuple(bot.entity?.position) || curNow;
             const movedTotal = Math.hypot(endNow[0] - startPos[0], endNow[2] - startPos[2]);
