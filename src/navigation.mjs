@@ -378,6 +378,14 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
     typeof opts.maxDropDown === "number" && Number.isFinite(opts.maxDropDown)
       ? Math.max(3, Math.min(4, Math.floor(opts.maxDropDown)))
       : null;
+  const requestedThinkMs =
+    typeof opts.thinkTimeout === "number" && Number.isFinite(opts.thinkTimeout)
+      ? Math.max(200, Math.min(5_000, Math.floor(opts.thinkTimeout)))
+      : null;
+  const requestedSearchRadius =
+    typeof opts.searchRadius === "number" && Number.isFinite(opts.searchRadius)
+      ? Math.max(8, Math.min(96, Math.floor(opts.searchRadius)))
+      : null;
 
   if (profileName === MOVEMENT_PROFILES.COMBAT_NODIG) {
     return {
@@ -393,6 +401,8 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
       canOpenDoors: false,
       allowParkour: true,
       allowSprinting: true,
+      thinkTimeout: requestedThinkMs ?? 1_200,
+      searchRadius: requestedSearchRadius ?? 32,
     };
   }
 
@@ -411,6 +421,8 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
       canOpenDoors: true,
       allowParkour: true,
       allowSprinting: true,
+      thinkTimeout: requestedThinkMs ?? 2_200,
+      searchRadius: requestedSearchRadius ?? 48,
     };
   }
 
@@ -430,6 +442,8 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
       canOpenDoors: true,
       allowParkour: true,
       allowSprinting: true,
+      thinkTimeout: requestedThinkMs ?? 2_500,
+      searchRadius: requestedSearchRadius ?? 40,
     };
   }
 
@@ -449,6 +463,8 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
     canOpenDoors: true,
     allowParkour: true,
     allowSprinting: true,
+    thinkTimeout: requestedThinkMs ?? 1_500,
+    searchRadius: requestedSearchRadius ?? 48,
   };
 }
 
@@ -518,6 +534,8 @@ export function createMovementProfile(
       if (Array.isArray(movements.scafoldingBlocks)) {
         movements.scafoldingBlocks = spec.allowScaffold ? scaffoldIds : [];
       }
+      movements.thinkTimeout = spec.thinkTimeout;
+      movements.searchRadius = spec.searchRadius;
 
       return movements;
     } catch {
@@ -541,6 +559,8 @@ export function createMovementProfile(
     allowParkour: spec.allowParkour,
     maxDropDown: spec.maxDropDown,
     canOpenDoors: spec.canOpenDoors,
+    thinkTimeout: spec.thinkTimeout,
+    searchRadius: spec.searchRadius,
     scafoldingBlocks: spec.allowScaffold
       ? scaffoldIds.length > 0
         ? scaffoldIds
@@ -562,6 +582,12 @@ export function applyMovementProfile(
   if (!bot.pathfinder || typeof bot.pathfinder.setMovements !== "function") return null;
   const movements = createMovementProfile(bot, profileName, opts);
   if (movements) {
+    if (typeof movements.thinkTimeout === "number") {
+      bot.pathfinder.thinkTimeout = movements.thinkTimeout;
+    }
+    if (typeof movements.searchRadius === "number") {
+      bot.pathfinder.searchRadius = movements.searchRadius;
+    }
     bot.pathfinder.setMovements(movements);
   }
   return movements;
@@ -998,7 +1024,13 @@ export async function navigateToGoal(
       attempts: ladder.length,
     };
   } finally {
-    if (restoreDefaultAfter && (ladder.length > 1 || startProfile !== MOVEMENT_PROFILES.CRUISE_WALK)) {
+    const hasCustomBudget =
+      profileOpts &&
+      (profileOpts.thinkTimeout !== undefined || profileOpts.searchRadius !== undefined);
+    if (
+      restoreDefaultAfter &&
+      (ladder.length > 1 || startProfile !== MOVEMENT_PROFILES.CRUISE_WALK || hasCustomBudget)
+    ) {
       applyMovementProfile(bot, MOVEMENT_PROFILES.CRUISE_WALK);
     }
   }

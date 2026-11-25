@@ -4,6 +4,8 @@ import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import vec3 from "vec3";
 import pathfinderPkg from "mineflayer-pathfinder";
+import { McRuntime } from "../src/behaviors.mjs";
+import { loadConfig } from "../src/protocol.mjs";
 import {
   HAZARD_AVOID_BLOCKS,
   MOVEMENT_PROFILES,
@@ -416,4 +418,283 @@ test("Event-driven navigateToGoal: rejects silent noPath, auto-escalates cruise_
   assert.equal(combatMoves.canDig, false);
   assert.equal(combatMoves.allow1by1towers, false);
   assert.deepEqual(combatMoves.scafoldingBlocks, []);
+});
+
+function makeRuntimeConfig(overrides = {}) {
+  return loadConfig({
+    MC_BRIDGE_TOKEN: "test-token-for-navigation-12345678",
+    MC_ENABLED: "true",
+    MC_HOST: "127.0.0.1",
+    MC_PORT: "25565",
+    MC_USERNAME: "HakimiBot",
+    MC_ALLOWED_PLAYERS: "BOISER",
+    MC_ALLOW_CHAT: "true",
+    ...overrides,
+  });
+}
+
+function makeLightRuntimeBot({ pos = vec3(0, 64, 0), items = [], blockFn = null } = {}) {
+  const bot = new EventEmitter();
+  bot.username = "HakimiBot";
+  bot.health = 20;
+  bot.food = 20;
+  bot.game = { dimension: "overworld" };
+  bot.time = { timeOfDay: 14000 };
+  bot.entity = { id: 0, position: pos.clone(), onGround: true, effects: {} };
+  bot.entities = { 0: bot.entity };
+  bot.players = {};
+  bot.heldItem = items[0] ?? null;
+  bot.registry = {
+    blocksByName: {
+      air: { id: 0, name: "air" },
+      stone: { id: 1, name: "stone" },
+      dirt: { id: 3, name: "dirt" },
+      water: { id: 9, name: "water" },
+    },
+  };
+  bot.inventory = {
+    items: () => items.slice(),
+    emptySlotCount: () => Math.max(0, 36 - items.length),
+  };
+  bot.blockAt = (p) => {
+    const x = Math.floor(p.x);
+    const y = Math.floor(p.y);
+    const z = Math.floor(p.z);
+    const name = blockFn ? blockFn(x, y, z) : y <= 63 ? "dirt" : "air";
+    return {
+      name,
+      boundingBox: name === "air" || name === "water" ? "empty" : "block",
+      position: vec3(x, y, z),
+    };
+  };
+  bot.findBlocks = () => [];
+  bot.dig = async () => {};
+  bot.placeBlock = async () => {};
+  bot.equip = async () => {};
+  bot.lookAt = async () => {};
+  bot.clearControlStates = () => {};
+  bot.setControlState = () => {};
+  bot.setSprinting = () => {};
+  bot.pathfinder = {
+    setMovements: () => {},
+    setGoal: () => {},
+    stop: () => {},
+    goto: async () => {},
+  };
+  return bot;
+}
+
+test("v2.10.1: per-profile thinkTimeout & searchRadius are applied onto bot.pathfinder with bounded overrides", () => {
+  const bot = makeRealVoxelBot({
+    items: [{ name: "stone_pickaxe", count: 1 }],
+  });
+
+  const expected = [
+    [MOVEMENT_PROFILES.COMBAT_NODIG, 1_200, 32],
+    [MOVEMENT_PROFILES.CRUISE_WALK, 1_500, 48],
+    [MOVEMENT_PROFILES.NATURAL_TRAVERSE, 2_200, 48],
+    [MOVEMENT_PROFILES.ESCAPE_ROCK, 2_500, 40],
+  ];
+  for (const [profile, thinkTimeout, searchRadius] of expected) {
+    const moves = applyMovementProfile(bot, profile);
+    assert.equal(moves.thinkTimeout, thinkTimeout, `${profile} movements.thinkTimeout`);
+    assert.equal(moves.searchRadius, searchRadius, `${profile} movements.searchRadius`);
+    assert.equal(bot.pathfinder.thinkTimeout, thinkTimeout, `${profile} pathfinder.thinkTimeout`);
+    assert.equal(bot.pathfinder.searchRadius, searchRadius, `${profile} pathfinder.searchRadius`);
+  }
+
+  // Custom tight budget overrides and clamping bounds
+  const tight = applyMovementProfile(bot, MOVEMENT_PROFILES.CRUISE_WALK, {
+    thinkTimeout: 1_000,
+    searchRadius: 16,
+  });
+  assert.equal(tight.thinkTimeout, 1_000);
+  assert.equal(tight.searchRadius, 16);
+  assert.equal(bot.pathfinder.thinkTimeout, 1_000);
+  assert.equal(bot.pathfinder.searchRadius, 16);
+
+  const clamped = applyMovementProfile(bot, MOVEMENT_PROFILES.CRUISE_WALK, {
+    thinkTimeout: 50,
+    searchRadius: 999,
+  });
+  assert.equal(clamped.thinkTimeout, 200);
+  assert.equal(clamped.searchRadius, 96);
+  assert.equal(bot.pathfinder.thinkTimeout, 200);
+  assert.equal(bot.pathfinder.searchRadius, 96);
+});
+
+test("v2.10.1: explore timeout preserves real partial displacement (>=2.5 blocks) and fails on zero progress", async () => {
+  // 1. Timed out after moving 6 blocks horizontally -> partial success
+  const movingBot = makeLightRuntimeBot({ pos: vec3(0, 64, 0) });
+  movingBot.pathfinder.goto = async () => {
+    setTimeout(() => {
+      movingBot.entity.position = vec3(6, 64, 0);
+    }, 15);
+    await new Promise(() => {});
+  };
+  const movingRt = new McRuntime({
+    config: makeRuntimeConfig(),
+    createBotFn: () => movingBot,
+    actionTimeoutMs: 120,
+    stuckCheckIntervalMs: 5_000,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  try {
+    movingRt.connectBot();
+    movingBot.emit("spawn");
+    const res = await movingRt.dispatchGoal({ action_type: "explore", timeout_ms: 120 });
+    assert.equal(res.ok, true);
+    assert.equal(res.partial, true);
+    assert.equal(res.moved_blocks, 6);
+    assert.match(res.summary, /探索推进至\(6,0\).*移动6格\(时间上限\)/);
+  } finally {
+    movingRt.stop();
+  }
+
+  // 2. Timed out with zero movement -> still fails as mc_goal_timeout
+  const stuckBot = makeLightRuntimeBot({ pos: vec3(0, 64, 0) });
+  stuckBot.pathfinder.goto = async () => {
+    await new Promise(() => {});
+  };
+  const stuckRt = new McRuntime({
+    config: makeRuntimeConfig(),
+    createBotFn: () => stuckBot,
+    actionTimeoutMs: 120,
+    stuckCheckIntervalMs: 5_000,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  try {
+    stuckRt.connectBot();
+    stuckBot.emit("spawn");
+    const res = await stuckRt.dispatchGoal({ action_type: "explore", timeout_ms: 120 });
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, "mc_goal_timeout");
+    assert.equal(res.moved_blocks, 0);
+  } finally {
+    stuckRt.stop();
+  }
+});
+
+test("v2.10.1: goto timeout preserves forward progress and rejects stationary or wrong-way timeouts", async () => {
+  async function runGotoCase(moveToPos) {
+    const bot = makeLightRuntimeBot({ pos: vec3(0, 64, 0) });
+    bot.pathfinder.goto = async () => {
+      if (moveToPos) {
+        setTimeout(() => {
+          bot.entity.position = moveToPos.clone();
+        }, 15);
+      }
+      await new Promise(() => {});
+    };
+    const rt = new McRuntime({
+      config: makeRuntimeConfig(),
+      createBotFn: () => bot,
+      actionTimeoutMs: 120,
+      stuckCheckIntervalMs: 5_000,
+      snapshotIntervalMs: 60_000,
+      survivalTickMs: 60_000,
+      companionTickMs: 60_000,
+    });
+    try {
+      rt.connectBot();
+      bot.emit("spawn");
+      return await rt.dispatchGoal({ action_type: "goto", x: 20, y: 64, z: 0, timeout_ms: 120 });
+    } finally {
+      rt.stop();
+    }
+  }
+
+  // Forward progress (+6 blocks closer to (20,64,0)) -> partial ok
+  const forwardRes = await runGotoCase(vec3(6, 64, 0));
+  assert.equal(forwardRes.ok, true);
+  assert.equal(forwardRes.partial, true);
+  assert.equal(forwardRes.moved_blocks, 6);
+
+  // Near destination (within 4.5 blocks of (20,64,0)) -> full ok (partial=false)
+  const nearRes = await runGotoCase(vec3(17, 64, 0));
+  assert.equal(nearRes.ok, true);
+  assert.equal(nearRes.partial, false);
+  assert.equal(nearRes.moved_blocks, 17);
+
+  // Wrong-way displacement (-6 blocks away) -> rejected as timeout
+  const awayRes = await runGotoCase(vec3(-6, 64, 0));
+  assert.equal(awayRes.ok, false);
+  assert.equal(awayRes.reason, "mc_goal_timeout");
+  assert.equal(awayRes.moved_blocks, 6);
+
+  // Stationary -> rejected as timeout
+  const idleRes = await runGotoCase(null);
+  assert.equal(idleRes.ok, false);
+  assert.equal(idleRes.reason, "mc_goal_timeout");
+  assert.equal(idleRes.moved_blocks, 0);
+});
+
+test("v2.10.1: shelter enter spot probing uses tight cruise_walk without 3-tier escalation and restores defaults", async () => {
+  // Standing at (0,64,0) above water (cannot dig shaft here), while (2,64,0) has 3-deep dirt over stone
+  const bot = makeLightRuntimeBot({
+    pos: vec3(0, 64, 0),
+    items: [
+      { name: "stone_pickaxe", type: 274, count: 1 },
+      { name: "dirt", type: 3, count: 6 },
+    ],
+    blockFn: (x, y, z) => {
+      if (x === 0 && z === 0 && y === 63) return "water";
+      if (y <= 60) return "stone";
+      if (y <= 63) return "dirt";
+      return "air";
+    },
+  });
+
+  const movementTrace = [];
+  bot.pathfinder = {
+    getPathTo: () => ({ status: "noPath", path: [] }),
+    setMovements: (m) => {
+      movementTrace.push({
+        profile: m.profileName,
+        thinkTimeout: bot.pathfinder.thinkTimeout,
+        searchRadius: bot.pathfinder.searchRadius,
+      });
+    },
+    stop: () => {},
+    setGoal: (goal) => {
+      if (!goal) return;
+      queueMicrotask(() => {
+        bot.emit("path_update", { status: "noPath", path: [] });
+      });
+    },
+  };
+
+  const rt = new McRuntime({
+    config: makeRuntimeConfig(),
+    createBotFn: () => bot,
+    stuckCheckIntervalMs: 5_000,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  try {
+    rt.connectBot();
+    bot.emit("spawn");
+    movementTrace.length = 0;
+
+    const res = await rt.dispatchGoal({ action_type: "shelter", mode: "enter" });
+    assert.equal(res.ok, false);
+    assert.ok(movementTrace.length >= 2, `expected shelter probe + restore, got ${movementTrace.length}`);
+    // Never escalated to natural_traverse or escape_rock even while holding stone_pickaxe
+    for (const entry of movementTrace) {
+      assert.equal(entry.profile, MOVEMENT_PROFILES.CRUISE_WALK);
+    }
+    // Probing calls used the tight 1000ms / 16-block budget
+    assert.equal(movementTrace[0].thinkTimeout, 1_000);
+    assert.equal(movementTrace[0].searchRadius, 16);
+    // Final restore reset bot.pathfinder back to standard cruise_walk defaults
+    assert.equal(bot.pathfinder.thinkTimeout, 1_500);
+    assert.equal(bot.pathfinder.searchRadius, 48);
+  } finally {
+    rt.stop();
+  }
 });

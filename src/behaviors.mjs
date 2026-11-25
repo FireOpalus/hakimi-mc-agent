@@ -3207,6 +3207,40 @@ export class McRuntime {
         return isNearDest() || movedEnough() ? { ok: true } : { stuck: true };
       });
       this._refreshFromBot();
+      const endPosGoto = this._vecToTuple(bot.entity?.position) || this.pos;
+      const actualMovedGoto =
+        startPos && endPosGoto
+          ? Math.hypot(
+              endPosGoto[0] - startPos[0],
+              endPosGoto[1] - startPos[1],
+              endPosGoto[2] - startPos[2],
+            )
+          : 0;
+      const startDistGoto = startPos
+        ? Math.hypot(startPos[0] - coords.x, startPos[1] - coords.y, startPos[2] - coords.z)
+        : Infinity;
+      const endDistGoto = endPosGoto
+        ? Math.hypot(endPosGoto[0] - coords.x, endPosGoto[1] - coords.y, endPosGoto[2] - coords.z)
+        : Infinity;
+      const movedBlocksGoto = Math.round(actualMovedGoto);
+      if (outcome?.timedOut && (endDistGoto <= 4.5 || (actualMovedGoto >= 4.0 && endDistGoto < startDistGoto - 3.0))) {
+        const partialGoto = endDistGoto > 4.5;
+        const summary = partialGoto
+          ? `已向(${Math.round(coords.x)},${Math.round(coords.y)},${Math.round(coords.z)})推进${movedBlocksGoto}格(时间上限)`
+          : `已到达(${Math.round(coords.x)},${Math.round(coords.y)},${Math.round(coords.z)})附近`;
+        this.activity = this.paused ? "已暂停" : "原地待命";
+        if (this.connected) this._emitSnapshot();
+        return {
+          ok: true,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          partial: partialGoto,
+          moved_blocks: movedBlocksGoto,
+          summary,
+          snapshot: this.getSnapshot(),
+        };
+      }
       if (outcome?.stuck || outcome?.timedOut || outcome?.aborted) {
         this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
         if (this.connected) this._emitSnapshot();
@@ -3220,6 +3254,7 @@ export class McRuntime {
             : outcome.timedOut
               ? "mc_goal_timeout"
               : "mc_goal_cancelled",
+          moved_blocks: movedBlocksGoto,
           summary: outcome.stuck ? "寻路卡住已中止" : outcome.timedOut ? "寻路超时" : "寻路已取消",
           snapshot: this.getSnapshot(),
         };
@@ -3232,6 +3267,7 @@ export class McRuntime {
         accepted: true,
         bridge_ready: true,
         paused: false,
+        moved_blocks: movedBlocksGoto,
         summary,
         snapshot: this.getSnapshot(),
       };
@@ -3322,7 +3358,32 @@ export class McRuntime {
       const signs = this.connected ? this._scanSigns(bot, 24) : [];
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
       if (this.connected) this._emitSnapshot();
-      const movedBlocks = typeof outcome?.movedBlocks === "number" ? outcome.movedBlocks : 0;
+      const endPosExp = this._vecToTuple(bot.entity?.position) || this.pos || startPos;
+      const actualMovedExp = Math.hypot(endPosExp[0] - startPos[0], endPosExp[2] - startPos[2]);
+      const movedBlocks = Math.max(
+        typeof outcome?.movedBlocks === "number" ? outcome.movedBlocks : 0,
+        Math.round(actualMovedExp),
+      );
+      if (outcome?.timedOut && actualMovedExp >= 2.5) {
+        targetX = Math.round(endPosExp[0]);
+        targetZ = Math.round(endPosExp[2]);
+        const summary = `探索推进至(${targetX},${targetZ}) 移动${movedBlocks}格(时间上限) 发现稀有矿${rare.length}处 告示牌${signs.length}块`;
+        if (rare.length > 0 || signs.length > 0) {
+          this._emitMilestone("mc_goal_completed", "normal", { action_type: "explore", summary });
+        }
+        return {
+          ok: true,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          partial: true,
+          summary,
+          moved_blocks: movedBlocks,
+          rare_blocks: rare,
+          signs,
+          snapshot: this.getSnapshot(),
+        };
+      }
       if (outcome?.noProgress || outcome?.stuck || outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -4401,12 +4462,19 @@ export class McRuntime {
       }
       this.activity = parsed.mode === "exit" ? "离开掩体" : "挖建夜间掩体";
       this._emitSnapshot();
+      const shelterGotoOpts =
+        parsed.mode === "exit"
+          ? {}
+          : {
+              escalate: false,
+              profileOpts: { thinkTimeout: 1_000, searchRadius: 16 },
+            };
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
         return await executeShelterAction(bot, params, {
           signal,
           shelterState: this._shelterState,
           timeOfDay: this.timeOfDay,
-          gotoGoal: (goal, sig) => this._gotoGoal(goal, sig),
+          gotoGoal: (goal, sig) => this._gotoGoal(goal, sig, shelterGotoOpts),
           autoEquip: this.config.mcAutoEquip !== false,
         });
       });
