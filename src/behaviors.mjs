@@ -916,7 +916,11 @@ export class McRuntime {
           {
             shelterState: this._shelterState,
             timeOfDay: this.timeOfDay,
-            gotoGoal: (goal, sig) => this._gotoGoal(goal, sig),
+            gotoGoal: (goal, sig) =>
+              this._gotoGoal(goal, sig, {
+                allowRockEscape: false,
+                profileOpts: { thinkTimeout: 1_200, searchRadius: 20 },
+              }),
             autoEquip: this.config.mcAutoEquip !== false,
           },
         );
@@ -3299,6 +3303,15 @@ export class McRuntime {
       this.activity = `${candidates[0]?.label || "探索"}(${targetX},${targetZ})`;
       this._emitSnapshot();
       let unstickTried = false;
+      const computeExploreProgress = (fromPos, toPos) => {
+        if (!fromPos || !toPos) return 0;
+        const dx = toPos[0] - fromPos[0];
+        const dy = toPos[1] - fromPos[1];
+        const dz = toPos[2] - fromPos[2];
+        // Ignore in-place jumping and falling down; count genuine upward climbs (dy >= 1.5) out of pits/caves.
+        const effectiveDy = dy >= 1.5 ? dy : 0;
+        return Math.hypot(dx, effectiveDy, dz);
+      };
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
         let lastMoved = 0;
         let sawStuck = false;
@@ -3319,7 +3332,7 @@ export class McRuntime {
             await this._gotoGoal(new GoalNearXZ(targetX, targetZ, 2), signal, navOpts);
             if (signal.aborted) return { aborted: true };
             const endNow = this._vecToTuple(bot.entity?.position) || curNow;
-            const movedTotal = Math.hypot(endNow[0] - startPos[0], endNow[2] - startPos[2]);
+            const movedTotal = computeExploreProgress(startPos, endNow);
             lastMoved = Math.max(lastMoved, movedTotal);
             if (movedTotal >= 2.5) {
               targetX = Math.round(endNow[0]);
@@ -3333,7 +3346,7 @@ export class McRuntime {
           } catch (err) {
             if (signal.aborted) return { aborted: true };
             const endNow = this._vecToTuple(bot.entity?.position) || curNow;
-            const movedTotal = Math.hypot(endNow[0] - startPos[0], endNow[2] - startPos[2]);
+            const movedTotal = computeExploreProgress(startPos, endNow);
             lastMoved = Math.max(lastMoved, movedTotal);
             if (movedTotal >= 2.5) {
               targetX = Math.round(endNow[0]);
@@ -3359,7 +3372,7 @@ export class McRuntime {
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
       if (this.connected) this._emitSnapshot();
       const endPosExp = this._vecToTuple(bot.entity?.position) || this.pos || startPos;
-      const actualMovedExp = Math.hypot(endPosExp[0] - startPos[0], endPosExp[2] - startPos[2]);
+      const actualMovedExp = computeExploreProgress(startPos, endPosExp);
       const movedBlocks = Math.max(
         typeof outcome?.movedBlocks === "number" ? outcome.movedBlocks : 0,
         Math.round(actualMovedExp),
@@ -4464,7 +4477,10 @@ export class McRuntime {
       this._emitSnapshot();
       const shelterGotoOpts =
         parsed.mode === "exit"
-          ? {}
+          ? {
+              allowRockEscape: false,
+              profileOpts: { thinkTimeout: 1_200, searchRadius: 20 },
+            }
           : {
               escalate: false,
               profileOpts: { thinkTimeout: 1_000, searchRadius: 16 },

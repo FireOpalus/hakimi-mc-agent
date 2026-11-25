@@ -5,6 +5,7 @@ import {
   MOVEMENT_PROFILES,
   SAFE_SCAFFOLD_BLOCKS,
   applyMovementProfile,
+  isPlayerBuildSignatureBlock,
 } from "./navigation.mjs";
 import {
   extractCanonicalItemName,
@@ -1397,25 +1398,57 @@ export async function executeShelterAction(
       [0, 1],
       [0, -1],
     ];
-    const isClearOrHarvestable = (blk) => {
+    const isOpenAir = (blk) => {
       if (!blk) return true;
       const name = normalizeCanonicalItemId(blk.name);
-      if (!name || REPLACEABLE_BLOCKS.has(name)) return true;
-      if (isHazardousBlock(blk)) return false;
-      if (!SHELTER_DIGGABLE_TERRAIN.has(name) && !SHELTER_CAP_BLOCKS.has(name)) return false;
-      return checkHarvestToolTier(bot, name).ok;
+      return !name || REPLACEABLE_BLOCKS.has(name);
+    };
+    const isProtectedOrBlocked = (blk) => {
+      if (!blk) return false;
+      const name = normalizeCanonicalItemId(blk.name);
+      if (!name || REPLACEABLE_BLOCKS.has(name)) return false;
+      if (isHazardousBlock(blk) || isPlayerBuildSignatureBlock(name)) return true;
+      if (!SHELTER_DIGGABLE_TERRAIN.has(name) && !SHELTER_CAP_BLOCKS.has(name)) return true;
+      return !checkHarvestToolTier(bot, name).ok;
     };
     let chosenDir = null;
+    let bestScore = -Infinity;
     for (const [dx, dz] of dirs) {
       const s1a = bot.blockAt(vec3(shaftX + dx, footY + 1, shaftZ + dz));
       const s1b = bot.blockAt(vec3(shaftX + dx, footY + 2, shaftZ + dz));
+      const s1c = bot.blockAt(vec3(shaftX + dx, footY + 3, shaftZ + dz));
       const s2a = bot.blockAt(vec3(shaftX + dx * 2, footY + 2, shaftZ + dz * 2));
-      if (isHazardousBlock(s1a) || isHazardousBlock(s1b) || isHazardousBlock(s2a)) continue;
-      if (isClearOrHarvestable(s1a) && isClearOrHarvestable(s1b)) {
-        chosenDir = [dx, dz];
-        break;
+      const s2b = bot.blockAt(vec3(shaftX + dx * 2, footY + 3, shaftZ + dz * 2));
+      const s2Floor = bot.blockAt(vec3(shaftX + dx * 2, footY + 1, shaftZ + dz * 2));
+      const s3a = bot.blockAt(vec3(shaftX + dx * 3, footY + 2, shaftZ + dz * 3));
+      const s3b = bot.blockAt(vec3(shaftX + dx * 3, footY + 3, shaftZ + dz * 3));
+      if (
+        isHazardousBlock(s1a) ||
+        isHazardousBlock(s1b) ||
+        isHazardousBlock(s1c) ||
+        isHazardousBlock(s2a) ||
+        isHazardousBlock(s2b)
+      ) {
+        continue;
       }
-      if (!chosenDir) {
+      let score = 0;
+      if (isProtectedOrBlocked(s1a) || isProtectedOrBlocked(s1b)) {
+        score -= 10;
+      } else {
+        score += 3;
+        if (isOpenAir(s1a) && isOpenAir(s1b)) score += 2;
+      }
+      if (isProtectedOrBlocked(s1c)) score -= 4;
+      if (isProtectedOrBlocked(s2a) || isProtectedOrBlocked(s2b)) {
+        score -= 8;
+      } else {
+        score += 3;
+        if (isOpenAir(s2a) && isOpenAir(s2b)) score += 5;
+      }
+      if (isSolidNonHazardWall(s2Floor)) score += 2;
+      if (isOpenAir(s3a) && isOpenAir(s3b)) score += 3;
+      if (score > bestScore) {
+        bestScore = score;
         chosenDir = [dx, dz];
       }
     }
@@ -1427,11 +1460,12 @@ export async function executeShelterAction(
       await digBlockSafe(shaftX + dx, footY + 3, shaftZ + dz);
       await digBlockSafe(shaftX + dx * 2, footY + 2, shaftZ + dz * 2);
       await digBlockSafe(shaftX + dx * 2, footY + 3, shaftZ + dz * 2);
-      exitTarget = [shaftX + dx * 3, Math.max(footY + 3, surfaceY), shaftZ + dz * 3];
+      await digBlockSafe(shaftX + dx * 2, footY + 4, shaftZ + dz * 2);
+      exitTarget = [shaftX + dx * 2, footY + 2, shaftZ + dz * 2];
     }
     if (typeof gotoGoal === "function" && !signal?.aborted) {
       try {
-        await gotoGoal(new GoalNear(exitTarget[0], exitTarget[1], exitTarget[2], 2), signal);
+        await gotoGoal(new GoalNear(exitTarget[0], exitTarget[1], exitTarget[2], 1), signal);
       } catch {
         // Best-effort exit walk
       }
@@ -1440,16 +1474,18 @@ export async function executeShelterAction(
 
   if (effectiveMode === "exit") {
     const cap = Array.isArray(state.capPos) ? state.capPos : [bx, by + 2, bz];
+    const exitSurfaceY = cap[1] + 1;
     // 1. Open roof cap above head
     await digBlockSafe(cap[0], cap[1], cap[2]);
     await digBlockSafe(cap[0], cap[1] + 1, cap[2]);
-    // 2. Carve a safe 2-step staircase out in the first hazard-free, tool-diggable cardinal direction
-    await carveStaircaseOut(bx, by, bz, cap[1] + 1);
-
+    // Clear sheltered flag immediately once roof is opened so a slow walk-out never leaves it stuck active.
     state.active = false;
     state.capPos = null;
     state.holePos = null;
     state.surfaceY = null;
+    // 2. Carve a safe 2-step staircase out toward the clearest, hazard/build-free cardinal direction
+    await carveStaircaseOut(bx, by, bz, exitSurfaceY);
+
     return {
       ok: true,
       mode: "exit",

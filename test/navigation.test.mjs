@@ -698,3 +698,148 @@ test("v2.10.1: shelter enter spot probing uses tight cruise_walk without 3-tier 
     rt.stop();
   }
 });
+
+test("v2.10.2: explore counts genuine vertical climb (>=1.5 blocks) and ignores in-place jumping", async () => {
+  // 1. Climbing vertically out of a 3-block pit (y=65 -> y=68, dx=0.5, dz=0.5) counts as partial success
+  const climbBot = makeLightRuntimeBot({ pos: vec3(6.5, 65, 9.5) });
+  climbBot.pathfinder.goto = async () => {
+    setTimeout(() => {
+      climbBot.entity.position = vec3(7.0, 68.0, 10.0);
+    }, 15);
+    await new Promise(() => {});
+  };
+  const climbRt = new McRuntime({
+    config: makeRuntimeConfig(),
+    createBotFn: () => climbBot,
+    actionTimeoutMs: 120,
+    stuckCheckIntervalMs: 5_000,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  try {
+    climbRt.connectBot();
+    climbBot.emit("spawn");
+    const res = await climbRt.dispatchGoal({ action_type: "explore", timeout_ms: 120 });
+    assert.equal(res.ok, true);
+    assert.equal(res.partial, true);
+    assert.equal(res.moved_blocks, 3);
+  } finally {
+    climbRt.stop();
+  }
+
+  // 2. Ordinary in-place jump (dy=0.8 < 1.5) still fails as mc_goal_timeout
+  const jumpBot = makeLightRuntimeBot({ pos: vec3(6.5, 65, 9.5) });
+  jumpBot.pathfinder.goto = async () => {
+    setTimeout(() => {
+      jumpBot.entity.position = vec3(6.6, 65.8, 9.6);
+    }, 15);
+    await new Promise(() => {});
+  };
+  const jumpRt = new McRuntime({
+    config: makeRuntimeConfig(),
+    createBotFn: () => jumpBot,
+    actionTimeoutMs: 120,
+    stuckCheckIntervalMs: 5_000,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  try {
+    jumpRt.connectBot();
+    jumpBot.emit("spawn");
+    const res = await jumpRt.dispatchGoal({ action_type: "explore", timeout_ms: 120 });
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, "mc_goal_timeout");
+  } finally {
+    jumpRt.stop();
+  }
+});
+
+test("v2.10.2: shelter exit picks open-air direction over crafting_table/stone walls, clears state, and caps search budget", async () => {
+  // Bot at (0, 65, 0) inside shelter (cap at 0,67,0).
+  // +X (east) has crafting_table at (1,66,0) and solid stone wall at x>=2.
+  // -X (west) has solid stone wall.
+  // +Z (south) opens directly into air at z>=2 with solid ground at y=66!
+  // -Z (north) has solid stone wall.
+  const bot = makeLightRuntimeBot({
+    pos: vec3(0, 65, 0),
+    items: [
+      { name: "stone_pickaxe", type: 274, count: 1 },
+      { name: "dirt", type: 3, count: 6 },
+    ],
+    blockFn: (x, y, z) => {
+      if (x === 0 && z === 0) {
+        if (y === 65 || y === 66) return "air";
+        if (y === 67) return "dirt";
+        if (y >= 68) return "air";
+        return "stone";
+      }
+      if (x === 1 && z === 0 && y === 66) return "crafting_table";
+      if (x === 0 && z >= 1 && z <= 3) {
+        if (y >= 67) return "air";
+        if (z === 1 && y === 66) return "dirt";
+        return "stone";
+      }
+      return y <= 69 ? "stone" : "air";
+    },
+  });
+
+  const goalsSeen = [];
+  const profilesSeen = [];
+  bot.pathfinder = {
+    getPathTo: () => ({ status: "noPath", path: [] }),
+    setMovements: (m) => {
+      profilesSeen.push({
+        profile: m.profileName,
+        thinkTimeout: bot.pathfinder.thinkTimeout,
+        searchRadius: bot.pathfinder.searchRadius,
+      });
+    },
+    stop: () => {},
+    setGoal: (goal) => {
+      if (!goal) return;
+      goalsSeen.push({ x: goal.x, y: goal.y, z: goal.z });
+      queueMicrotask(() => {
+        bot.emit("path_update", { status: "noPath", path: [] });
+      });
+    },
+  };
+
+  const rt = new McRuntime({
+    config: makeRuntimeConfig(),
+    createBotFn: () => bot,
+    stuckCheckIntervalMs: 5_000,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  try {
+    rt.connectBot();
+    bot.emit("spawn");
+    rt._shelterState.active = true;
+    rt._shelterState.capPos = [0, 67, 0];
+    rt._shelterState.holePos = [0, 65, 0];
+    rt._shelterState.surfaceY = 68;
+    profilesSeen.length = 0;
+
+    const res = await rt.dispatchGoal({ action_type: "shelter", mode: "exit" });
+    assert.equal(res.ok, true);
+    assert.equal(res.sheltered, false);
+    assert.equal(rt._shelterState.active, false);
+    // Chose +Z open-air exit (0, 67, 2) instead of +X crafting_table/stone wall!
+    assert.ok(goalsSeen.length >= 1);
+    assert.deepEqual(goalsSeen[0], { x: 0, y: 67, z: 2 });
+    // Never escalated to escape_rock even with stone_pickaxe; capped to 1200ms / 20r
+    assert.equal(
+      profilesSeen.some((p) => p.profile === MOVEMENT_PROFILES.ESCAPE_ROCK),
+      false,
+    );
+    assert.equal(profilesSeen[0].thinkTimeout, 1_200);
+    assert.equal(profilesSeen[0].searchRadius, 20);
+    assert.equal(bot.pathfinder.thinkTimeout, 1_500);
+    assert.equal(bot.pathfinder.searchRadius, 48);
+  } finally {
+    rt.stop();
+  }
+});
