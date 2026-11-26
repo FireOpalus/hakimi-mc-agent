@@ -5,6 +5,7 @@ import {
   MOVEMENT_PROFILES,
   SAFE_SCAFFOLD_BLOCKS,
   applyMovementProfile,
+  clearBotControlStates,
   isPlayerBuildSignatureBlock,
 } from "./navigation.mjs";
 import {
@@ -1338,6 +1339,31 @@ function isSolidNonHazardWall(blk) {
   return blk.boundingBox !== "empty";
 }
 
+/**
+ * Wait briefly for gravity settlement (`onGround === true`) before calling `bot.dig()`
+ * so Mineflayer does not compute and lock a 5x airborne digging penalty when a pathfinder
+ * goal resolves mid-fall or mid-jump.
+ */
+export async function waitForStableGround(
+  bot,
+  { signal = null, timeoutMs = 650, pollMs = 35 } = {},
+) {
+  if (!bot?.entity || typeof bot.entity.onGround !== "boolean") return true;
+  if (bot.entity.isInWater) return false;
+  if (bot.entity.onGround === true) return true;
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() < deadline) {
+    if (signal?.aborted) return false;
+    if (bot.entity.isInWater) return false;
+    if (bot.entity.onGround === true) {
+      return true;
+    }
+    const okWait = await sleepAbortable(Math.max(10, pollMs), signal);
+    if (!okWait) return false;
+  }
+  return bot.entity.onGround === true;
+}
+
 async function waitForShaftLanding(
   bot,
   targetFootY,
@@ -1406,6 +1432,15 @@ export async function executeShelterAction(
     if (autoEquip) {
       await equipBestHarvestTool(bot, blk);
     }
+    if (!bot.entity?.isInWater) {
+      clearBotControlStates(bot);
+      await waitForStableGround(bot, {
+        signal,
+        timeoutMs: settleTimeoutMs > 0 ? Math.min(650, settleTimeoutMs) : 0,
+        pollMs: Math.max(10, settlePollMs),
+      });
+    }
+    if (signal?.aborted) return;
     try {
       await bot.dig(blk);
     } catch {
@@ -1841,6 +1876,17 @@ export async function executeShelterAction(
   // Dig vertical shaft (3-deep standard or 2-deep shallow fallback; zero fall damage)
   let dugCount = 0;
   for (const blk of plan.digTargets) {
+    if (signal?.aborted) {
+      return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
+    }
+    if (!bot.entity?.isInWater) {
+      clearBotControlStates(bot);
+      await waitForStableGround(bot, {
+        signal,
+        timeoutMs: settleTimeoutMs > 0 ? Math.min(650, settleTimeoutMs) : 0,
+        pollMs: Math.max(10, settlePollMs),
+      });
+    }
     if (signal?.aborted) {
       return { ok: false, mode: "enter", sheltered: false, reason: "mc_goal_cancelled", summary: "掩体已取消" };
     }

@@ -349,7 +349,68 @@ export function pickBestRecipeAnalysis(recipes, bot, remainingCount, countsMap) 
   return best;
 }
 
-async function craftPlanksFromLogs(bot, { preferredPlankName = "", planksNeeded = 0, signal = null }) {
+function sleepCraftAbortable(ms, signal) {
+  if (signal?.aborted) return Promise.resolve(false);
+  const delay = Math.max(1, Number(ms) || 1);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (completed) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (signal && onAbort) {
+        try {
+          signal.removeEventListener("abort", onAbort);
+        } catch {
+          // Ignore listener removal errors
+        }
+      }
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    const timer = setTimeout(() => finish(true), delay);
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
+/**
+ * Wait briefly for Paper/Vanilla post-close_window inventory sync packets after `bot.craft()`.
+ * Resolves immediately once the crafted item count increases; on live servers, detects silent
+ * server-side window_click rollbacks instead of reporting phantom crafting success.
+ */
+async function waitForCraftInventoryConfirm(
+  bot,
+  itemName,
+  prevCount,
+  { signal = null, verifySync = false, timeoutMs = 450, pollMs = 25 } = {},
+) {
+  const initialNow = countInventoryByName(bot).get(itemName) ?? 0;
+  if (initialNow > prevCount) {
+    return { confirmed: true, gained: initialNow - prevCount };
+  }
+  if (!verifySync) {
+    return { confirmed: true, gained: 0, skipped: true };
+  }
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (Date.now() < deadline) {
+    if (signal?.aborted) return { confirmed: false, gained: 0, aborted: true };
+    const okWait = await sleepCraftAbortable(Math.max(10, pollMs), signal);
+    if (!okWait || signal?.aborted) return { confirmed: false, gained: 0, aborted: true };
+    const cur = countInventoryByName(bot).get(itemName) ?? 0;
+    if (cur > prevCount) {
+      return { confirmed: true, gained: cur - prevCount };
+    }
+  }
+  const finalCnt = countInventoryByName(bot).get(itemName) ?? 0;
+  return { confirmed: finalCnt > prevCount, gained: Math.max(0, finalCnt - prevCount) };
+}
+
+async function craftPlanksFromLogs(
+  bot,
+  { preferredPlankName = "", planksNeeded = 0, signal = null, verifySync = false, syncTimeoutMs = 450 },
+) {
   if (planksNeeded <= 0 || signal?.aborted || typeof bot.craft !== "function") return 0;
   let craftedPlanks = 0;
 
@@ -383,8 +444,17 @@ async function craftPlanksFromLogs(bot, { preferredPlankName = "", planksNeeded 
     const batches = Math.min(batchesNeeded, cand.logCount);
     if (batches <= 0) continue;
     try {
+      const beforePlanks = countInventoryByName(bot).get(cand.plankName) ?? 0;
       await bot.craft(recipe, batches, null);
-      craftedPlanks += batches * perBatch;
+      const sync = await waitForCraftInventoryConfirm(bot, cand.plankName, beforePlanks, {
+        signal,
+        verifySync,
+        timeoutMs: syncTimeoutMs,
+      });
+      if (sync.aborted) break;
+      if (!verifySync || sync.confirmed) {
+        craftedPlanks += sync.gained > 0 ? sync.gained : batches * perBatch;
+      }
     } catch {
       // Try next wood species if this batch failed
     }
@@ -392,7 +462,10 @@ async function craftPlanksFromLogs(bot, { preferredPlankName = "", planksNeeded 
   return craftedPlanks;
 }
 
-async function craftSticksFromPlanks(bot, { sticksNeeded = 0, signal = null }) {
+async function craftSticksFromPlanks(
+  bot,
+  { sticksNeeded = 0, signal = null, verifySync = false, syncTimeoutMs = 450 },
+) {
   if (sticksNeeded <= 0 || signal?.aborted || typeof bot.craft !== "function") return 0;
   const stickItem = bot.registry?.itemsByName?.stick;
   if (!stickItem) return 0;
@@ -413,8 +486,15 @@ async function craftSticksFromPlanks(bot, { sticksNeeded = 0, signal = null }) {
     }
     if (maxBatches <= 0) break;
     try {
+      const beforeSticks = counts.get("stick") ?? 0;
       await bot.craft(recipe, maxBatches, null);
-      craftedSticks += maxBatches * perBatch;
+      const sync = await waitForCraftInventoryConfirm(bot, "stick", beforeSticks, {
+        signal,
+        verifySync,
+        timeoutMs: syncTimeoutMs,
+      });
+      if (sync.aborted || (verifySync && !sync.confirmed)) break;
+      craftedSticks += sync.gained > 0 ? sync.gained : maxBatches * perBatch;
     } catch {
       break;
     }
@@ -429,7 +509,15 @@ async function craftSticksFromPlanks(bot, { sticksNeeded = 0, signal = null }) {
  */
 async function preprocessWoodMaterials(
   bot,
-  { targetItemName, candidateRecipes, targetCount, needsTableCraft, signal },
+  {
+    targetItemName,
+    candidateRecipes,
+    targetCount,
+    needsTableCraft,
+    signal,
+    verifySync = false,
+    syncTimeoutMs = 450,
+  },
 ) {
   if (signal?.aborted || candidateRecipes.length === 0) return;
 
@@ -478,6 +566,8 @@ async function preprocessWoodMaterials(
         preferredPlankName: specificPlankName,
         planksNeeded: specificPlankShortfall,
         signal,
+        verifySync,
+        syncTimeoutMs,
       });
     }
     const countsAfterSpecific = countInventoryByName(bot);
@@ -490,6 +580,8 @@ async function preprocessWoodMaterials(
         preferredPlankName: "",
         planksNeeded: remainingGenericShortfall,
         signal,
+        verifySync,
+        syncTimeoutMs,
       });
     }
   }
@@ -499,6 +591,8 @@ async function preprocessWoodMaterials(
     await craftSticksFromPlanks(bot, {
       sticksNeeded: stickShortfall,
       signal,
+      verifySync,
+      syncTimeoutMs,
     });
   }
 }
@@ -760,6 +854,8 @@ export async function executeCraftAction(
     signal = null,
     isUnreachableFn = null,
     markUnreachableFn = null,
+    verifyCraftSync = null,
+    craftSyncTimeoutMs = 450,
   } = {},
 ) {
   const parsed = parseCraftParams(params);
@@ -828,6 +924,9 @@ export async function executeCraftAction(
   const hasTableInInventory = (countsInitial.get("crafting_table") ?? 0) > 0;
   const needsTableCraft = !has2x2Recipe && !nearbyTableBefore && !hasTableInInventory;
 
+  const shouldVerifySync =
+    typeof verifyCraftSync === "boolean" ? verifyCraftSync : Boolean(bot?._client);
+
   // Step 1: Preprocess wood (<= 2 levels: log -> planks -> stick) if needed
   const directHandNow = getCraftableRecipesSafe(bot, targetItem.id, null);
   if (directHandNow.length === 0 || (requestedCount > 1 && has2x2Recipe) || !has2x2Recipe) {
@@ -837,6 +936,8 @@ export async function executeCraftAction(
       targetCount: requestedCount,
       needsTableCraft,
       signal,
+      verifySync: shouldVerifySync,
+      syncTimeoutMs: craftSyncTimeoutMs,
     });
   }
   if (signal?.aborted) {
@@ -928,7 +1029,13 @@ export async function executeCraftAction(
         );
         if (chosenTableRecipe && totalPlanksNow >= 4 + recipePlanksForOne) {
           try {
+            const beforeTables = curCounts.get("crafting_table") ?? 0;
             await bot.craft(chosenTableRecipe, 1, null);
+            await waitForCraftInventoryConfirm(bot, "crafting_table", beforeTables, {
+              signal,
+              verifySync: shouldVerifySync,
+              timeoutMs: craftSyncTimeoutMs,
+            });
           } catch {
             // Fall through to check below
           }
@@ -1005,6 +1112,8 @@ export async function executeCraftAction(
   // Step 3: Craft batches up to requestedCount
   let craftedCount = 0;
   let craftError = false;
+  let craftUnconfirmed = false;
+  let unconfirmedRetries = 0;
   while (craftedCount < requestedCount && !signal?.aborted) {
     const activeTable = usedTable ? craftingTableBlock : null;
     const availableRecipes = getCraftableRecipesSafe(bot, targetItem.id, activeTable);
@@ -1034,8 +1143,24 @@ export async function executeCraftAction(
     }
 
     try {
+      const beforeTargetCount = curCounts.get(itemName) ?? 0;
       await bot.craft(recipe, maxBatches, activeTable);
-      craftedCount += maxBatches * perBatch;
+      const sync = await waitForCraftInventoryConfirm(bot, itemName, beforeTargetCount, {
+        signal,
+        verifySync: shouldVerifySync,
+        timeoutMs: craftSyncTimeoutMs,
+      });
+      if (sync.aborted) break;
+      if (shouldVerifySync && !sync.confirmed) {
+        if (unconfirmedRetries < 1) {
+          unconfirmedRetries += 1;
+          continue;
+        }
+        craftUnconfirmed = true;
+        craftError = true;
+        break;
+      }
+      craftedCount += sync.gained > 0 ? sync.gained : maxBatches * perBatch;
     } catch {
       craftError = true;
       break;
@@ -1047,6 +1172,18 @@ export async function executeCraftAction(
   }
 
   if (craftedCount === 0) {
+    if (craftUnconfirmed) {
+      return {
+        ok: false,
+        accepted: true,
+        reason: "craft_not_confirmed",
+        item_name: itemName,
+        requested_count: requestedCount,
+        crafted_count: 0,
+        missing_materials: [],
+        summary: `合成${itemName}未获服务端确认（背包同步异常）`,
+      };
+    }
     const countsAfter = countInventoryByName(bot);
     const bestMiss = pickBestRecipeAnalysis(allKnownRecipes, bot, requestedCount, countsAfter);
     const missing = bestMiss?.missing ?? [];

@@ -64,6 +64,7 @@ import {
   parseHuntParams,
   parsePlaceParams,
   parseShelterParams,
+  waitForStableGround,
 } from "./world_actions.mjs";
 import {
   CREEPER_SAFE_DISTANCE,
@@ -2135,8 +2136,29 @@ export class McRuntime {
     }
   }
 
+  _stopBackgroundMotion(bot = this.bot, { clearFollowing = true } = {}) {
+    this._evadePlan = null;
+    if (clearFollowing) {
+      this._followingPlayer = null;
+    }
+    this._clearCombatMicroTimer();
+    if (bot) {
+      if (this._combatState?.shieldRaised) {
+        lowerShield(bot, this._combatState);
+      }
+      try {
+        bot.pathfinder?.stop?.();
+        bot.pathfinder?.setGoal?.(null);
+      } catch {
+        // Ignore pathfinder stop errors
+      }
+      clearBotControlStates(bot);
+    }
+  }
+
   async _runBoundedGoal(actionType, timeoutMs, fn) {
     this._cancelActiveGoal();
+    this._stopBackgroundMotion(this.bot, { clearFollowing: actionType !== "follow" });
     const boundedMs = Math.min(35_000, Math.max(100, timeoutMs ?? this.actionTimeoutMs));
     const controller = new AbortController();
     let timer = null;
@@ -2499,6 +2521,7 @@ export class McRuntime {
       signal = null,
       autoTorchAfterMine = false,
       initialPositions = null,
+      progress = null,
     },
   ) {
     const findCandidatePositions = () =>
@@ -2584,7 +2607,41 @@ export class McRuntime {
           buriedCandidates.push(entry);
         }
       }
-      const chosen = exposedCandidates[0] || buriedCandidates[0] || null;
+      // For tree logs, gently prefer trunk-base logs over upper canopy logs so hillside bots
+      // walk to the trunk base on ground instead of climbing onto tree canopies.
+      const candidatePool = exposedCandidates.length > 0 ? exposedCandidates : buriedCandidates;
+      if (
+        candidatePool.length > 1 &&
+        bot.entity?.position &&
+        typeof bot.blockAt === "function" &&
+        candidatePool.some((e) => String(e.blk?.name || rawBlock).endsWith("_log"))
+      ) {
+        const originPos = bot.entity.position;
+        const botY = Math.floor(originPos.y ?? 0);
+        const scoreLogCandidate = (entry) => {
+          const [cx, cy, cz] = entry.coords;
+          const dist3d = Math.hypot(
+            cx + 0.5 - (originPos.x ?? 0),
+            cy + 0.5 - (originPos.y ?? 0),
+            cz + 0.5 - (originPos.z ?? 0),
+          );
+          const name = String(entry.blk?.name || rawBlock);
+          if (!name.endsWith("_log")) return dist3d;
+          let below = null;
+          try {
+            below = bot.blockAt(vec3(Math.floor(cx), Math.floor(cy) - 1, Math.floor(cz)));
+          } catch {
+            below = null;
+          }
+          const hasLogBelow = Boolean(
+            below && typeof below.name === "string" && below.name.endsWith("_log"),
+          );
+          const canopyPenalty = Math.floor(cy) > botY + 2 ? 3.0 : 0;
+          return dist3d + (hasLogBelow ? 4.5 : 0) + canopyPenalty;
+        };
+        candidatePool.sort((a, b) => scoreLogCandidate(a) - scoreLogCandidate(b));
+      }
+      const chosen = candidatePool[0] || null;
       if (!chosen) {
         if (collectedCount === 0 && stuckSkips > 0) {
           return {
@@ -2658,6 +2715,21 @@ export class McRuntime {
           }
           break;
         }
+      }
+      if (signal?.aborted) {
+        return {
+          ok: collectedCount > 0,
+          aborted: true,
+          collected_count: collectedCount,
+          block: lastBlockName,
+          pos: lastCoords,
+        };
+      }
+      // Settle onto solid ground before measuring survival reach and calling bot.dig(),
+      // avoiding Mineflayer's 5x airborne digging penalty when goto resolves mid-fall/mid-jump.
+      if (!this._isBotInWater(bot)) {
+        clearBotControlStates(bot);
+        await waitForStableGround(bot, { signal });
       }
       if (signal?.aborted) {
         return {
@@ -2749,6 +2821,11 @@ export class McRuntime {
         }
       }
       collectedCount += 1;
+      if (progress) {
+        progress.collectedCount = collectedCount;
+        progress.lastBlockName = lastBlockName;
+        progress.lastCoords = lastCoords;
+      }
       await this._collectNearbyDrops(bot, chosenCoords, signal);
       if (autoTorchAfterMine && !signal?.aborted && !this._eatingLock.eating) {
         await tryAutoPlaceTorch(bot, this._autoTorchState, {
@@ -2865,7 +2942,7 @@ export class McRuntime {
   async pause() {
     this._cancelWakePoll();
     this._cancelActiveGoal();
-    this._clearCombatMicroTimer();
+    this._stopBackgroundMotion(this.bot);
     lowerShield(this.bot, this._combatState);
     this.paused = true;
     this.activity = "已暂停";
@@ -2972,17 +3049,9 @@ export class McRuntime {
 
     if (actionType === "idle" || actionType === "stop") {
       this._stayPut = true;
-      this._followingPlayer = null;
-      this._clearCombatMicroTimer();
-      lowerShield(this.bot, this._combatState);
       this._cancelActiveGoal();
-      try {
-        this.bot?.pathfinder?.stop?.();
-        this.bot?.pathfinder?.setGoal?.(null);
-      } catch {
-        // Ignore stop errors
-      }
-      clearBotControlStates(this.bot);
+      this._stopBackgroundMotion(this.bot);
+      lowerShield(this.bot, this._combatState);
       this.activity = this.connected ? "原地待命" : "待机";
       this._emitSnapshot();
       return {
@@ -3575,6 +3644,11 @@ export class McRuntime {
         };
       }
 
+      const gatherProgress = {
+        collectedCount: 0,
+        lastBlockName: rawBlock || "block",
+        lastCoords: [0, 0, 0],
+      };
       const outcome = await this._runBoundedGoal(actionType, timeoutMs, async (signal) => {
         return await this._gatherBlocksInternal(bot, {
           targets,
@@ -3583,15 +3657,23 @@ export class McRuntime {
           signal,
           autoTorchAfterMine: actionType === "mine",
           initialPositions,
+          progress: gatherProgress,
         });
       });
 
       this._refreshFromBot();
       this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
       if (this.connected) this._emitSnapshot();
-      const collectedCount = outcome?.collected_count ?? 0;
-      const lastBlockName = outcome?.block || rawBlock || "block";
-      const lastCoords = outcome?.pos || [0, 0, 0];
+      const outcomeCount = outcome?.collected_count ?? 0;
+      const collectedCount = Math.max(outcomeCount, gatherProgress.collectedCount);
+      const lastBlockName =
+        outcomeCount >= gatherProgress.collectedCount
+          ? outcome?.block || gatherProgress.lastBlockName || rawBlock || "block"
+          : gatherProgress.lastBlockName || rawBlock || "block";
+      const lastCoords =
+        outcomeCount >= gatherProgress.collectedCount
+          ? outcome?.pos || gatherProgress.lastCoords
+          : gatherProgress.lastCoords;
       if (
         collectedCount === 0 &&
         outcome?.blockedTierInfo &&
@@ -3678,10 +3760,11 @@ export class McRuntime {
           snapshot: this.getSnapshot(),
         };
       }
+      const timeoutSuffix = outcome?.timedOut ? "(时间上限)" : "";
       const summary =
         collectedCount > 1
-          ? `已采集${lastBlockName} x${collectedCount}(${lastCoords.join(",")})`
-          : `已采集${lastBlockName}(${lastCoords.join(",")})`;
+          ? `已采集${lastBlockName} x${collectedCount}(${lastCoords.join(",")})${timeoutSuffix}`
+          : `已采集${lastBlockName}(${lastCoords.join(",")})${timeoutSuffix}`;
       this._emitMilestone("mc_goal_completed", "normal", {
         action_type: actionType,
         summary,

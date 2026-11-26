@@ -943,3 +943,154 @@ test("v2.9.8 live-log fixes: intercept noPath empty-path resolve, enforce dig re
   farTreeRt.stop();
   cliffRt.stop();
 });
+
+test("v2.10.5 live-Paper fixes: bounded goals stop background evade pathfinder, settle onGround before digging, preserve partial gather on timeout, and prefer trunk-base logs", async () => {
+  // 1. Background _companionTick evade sets pathfinder goal without _activeGoalCancel;
+  //    starting shelter must stop pathfinder, clear _evadePlan, and clear controls before digging.
+  const shBlocks = new Map();
+  for (let dx = -1; dx <= 1; dx += 1) {
+    for (let dz = -1; dz <= 1; dz += 1) {
+      for (let y = 60; y <= 63; y += 1) {
+        shBlocks.set(`${dx},${y},${dz}`, { name: "dirt", boundingBox: "block" });
+      }
+      shBlocks.set(`${dx},64,${dz}`, { name: "air", boundingBox: "empty" });
+    }
+  }
+  const shBot = makeRichCraftBot({
+    pos: vec3(0.5, 64, 0.5),
+    initialItems: [{ name: "dirt", count: 8 }],
+    blocks: shBlocks,
+    entities: {
+      77: { id: 77, name: "zombie", type: "mob", position: vec3(5, 64, 0) },
+    },
+  });
+  let bgGoalActive = false;
+  let stopCalls = 0;
+  shBot.pathfinder.setGoal = (g) => {
+    bgGoalActive = Boolean(g);
+  };
+  shBot.pathfinder.stop = () => {
+    stopCalls += 1;
+    bgGoalActive = false;
+  };
+  shBot.entity.onGround = false;
+  let sawBgGoalDuringDig = false;
+  let digOnGroundStates = [];
+  shBot.dig = async (blk) => {
+    if (bgGoalActive) sawBgGoalDuringDig = true;
+    digOnGroundStates.push(shBot.entity.onGround);
+    if (blk?.position) {
+      shBlocks.set(`${blk.position.x},${blk.position.y},${blk.position.z}`, {
+        name: "air",
+        boundingBox: "empty",
+      });
+      shBot.entity.position = vec3(0.5, blk.position.y, 0.5);
+    }
+  };
+  shBot.placeBlock = async (ref, face) => {
+    const px = ref.position.x + face.x;
+    const py = ref.position.y + face.y;
+    const pz = ref.position.z + face.z;
+    shBlocks.set(`${px},${py},${pz}`, { name: "dirt", boundingBox: "block" });
+  };
+  const shRt = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "true" }),
+    createBotFn: () => shBot,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  shRt.connectBot();
+  shBot.emit("spawn");
+
+  await shRt._companionTick();
+  assert.equal(bgGoalActive, true);
+  assert.ok(shRt._evadePlan !== null);
+
+  // Simulate landing 30ms into shelter start -> waitForStableGround must wait until onGround === true
+  setTimeout(() => {
+    shBot.entity.onGround = true;
+  }, 30);
+
+  const shRes = await shRt.dispatchGoal({ action_type: "shelter", mode: "enter" });
+  assert.equal(shRes.ok, true);
+  assert.equal(sawBgGoalDuringDig, false);
+  assert.ok(stopCalls >= 1);
+  assert.equal(shRt._evadePlan, null);
+  assert.deepEqual(digOnGroundStates, [true, true, true]);
+  shRt.stop();
+
+  // 2. gather prefers trunk-base log (dirt below) over upper canopy log closer in 3D distance,
+  //    waits for onGround before bot.dig, and preserves partial collected_count on timeout.
+  const treeBlocks = new Map([
+    ["5,60,0", { name: "dirt", boundingBox: "block" }],
+    ["5,61,0", { name: "oak_log", boundingBox: "block" }],
+    ["5,62,0", { name: "oak_log", boundingBox: "block" }],
+    ["5,63,0", { name: "oak_log", boundingBox: "block" }],
+    ["5,64,0", { name: "oak_log", boundingBox: "block" }],
+    ["4,61,0", { name: "air", boundingBox: "empty" }],
+    ["4,62,0", { name: "air", boundingBox: "empty" }],
+    ["4,63,0", { name: "air", boundingBox: "empty" }],
+    ["4,64,0", { name: "air", boundingBox: "empty" }],
+  ]);
+  const treeBot = makeRichCraftBot({
+    pos: vec3(0, 65, 0),
+    blocks: treeBlocks,
+  });
+  // Return upper log FIRST in findBlocks (closer to hillside y=65), base log SECOND
+  treeBot.findBlocks = ({ matching }) => {
+    const ordered = [vec3(5, 64, 0), vec3(5, 63, 0), vec3(5, 62, 0), vec3(5, 61, 0)];
+    return ordered.filter((p) => {
+      const b = treeBlocks.get(`${p.x},${p.y},${p.z}`);
+      return b && matching(b);
+    });
+  };
+  treeBot.entity.onGround = true;
+  const dugLogs = [];
+  treeBot.pathfinder.goto = async (goal) => {
+    treeBot.entity.position = vec3(goal.x - 1, goal.y, goal.z);
+    // Simulate landing slightly after goto resolves
+    treeBot.entity.onGround = false;
+    setTimeout(() => {
+      treeBot.entity.onGround = true;
+    }, 25);
+  };
+  treeBot.dig = async (blk) => {
+    dugLogs.push({ y: blk.position.y, onGround: treeBot.entity.onGround });
+    if (dugLogs.length === 1) {
+      treeBlocks.set(`${blk.position.x},${blk.position.y},${blk.position.z}`, {
+        name: "air",
+        boundingBox: "empty",
+      });
+      return;
+    }
+    // 2nd log hangs past timeout_ms -> must preserve collected_count=1 as partial success!
+    await new Promise((r) => setTimeout(r, 500));
+  };
+  const treeRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => treeBot,
+    pickupSettleMs: 0,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  treeRt.connectBot();
+  treeBot.emit("spawn");
+
+  const gRes = await treeRt.dispatchGoal({
+    action_type: "gather",
+    block_type: "oak_log",
+    count: 2,
+    timeout_ms: 180,
+  });
+  assert.equal(gRes.ok, true);
+  assert.equal(gRes.partial, true);
+  assert.equal(gRes.collected_count, 1);
+  assert.match(gRes.summary, /时间上限/);
+  assert.equal(dugLogs[0].y, 61);
+  assert.equal(dugLogs[0].onGround, true);
+  treeRt.stop();
+});

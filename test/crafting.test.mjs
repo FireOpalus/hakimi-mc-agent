@@ -472,3 +472,66 @@ test("WS integration: craft RPC dispatches end-to-end and returns snapshot + mis
     await server.close();
   }
 });
+
+test("craft sync verification waits for delayed post-close_window inventory sync and rejects silent server rollback", async () => {
+  // 1. Delayed async sync: server delivers crafted item 40ms after bot.craft resolves
+  const delayedBot = createCraftingMockBot({ items: { oak_log: 1, coal: 1 } });
+  const origDelayedCraft = delayedBot.craft.bind(delayedBot);
+  delayedBot.craft = async (recipe, batches = 1, table = null) => {
+    const resName = ITEMS_TABLE[recipe.result.id].name;
+    if (resName === "torch") {
+      // Delay inventory mutation by 40ms to simulate Paper async post-close_window sync
+      setTimeout(() => {
+        void origDelayedCraft(recipe, batches, table);
+      }, 40);
+      return;
+    }
+    await origDelayedCraft(recipe, batches, table);
+  };
+  const okRes = await executeCraftAction(
+    delayedBot,
+    { item_name: "torch", count: 4 },
+    { verifyCraftSync: true, craftSyncTimeoutMs: 200 },
+  );
+  assert.equal(okRes.ok, true);
+  assert.equal(okRes.crafted_count, 4);
+  assert.equal(
+    delayedBot.inventory.items().find((i) => i.name === "torch")?.count,
+    4,
+  );
+
+  // 2. Silent rollback: server drops window_click on attempt 1, succeeds on retry attempt 2
+  const retryBot = createCraftingMockBot({ items: { oak_planks: 4 } });
+  const origRetryCraft = retryBot.craft.bind(retryBot);
+  let tableAttempts = 0;
+  retryBot.craft = async (recipe, batches = 1, table = null) => {
+    tableAttempts += 1;
+    if (tableAttempts === 1) {
+      // Simulate silent Paper rollback (no error thrown, inventory unchanged)
+      return;
+    }
+    await origRetryCraft(recipe, batches, table);
+  };
+  const retryRes = await executeCraftAction(
+    retryBot,
+    { item_name: "crafting_table", count: 1 },
+    { verifyCraftSync: true, craftSyncTimeoutMs: 60 },
+  );
+  assert.equal(retryRes.ok, true);
+  assert.equal(retryRes.crafted_count, 1);
+  assert.equal(tableAttempts, 2);
+
+  // 3. Persistent silent rollback: never confirms -> must report craft_not_confirmed instead of phantom ok=true
+  const ghostBot = createCraftingMockBot({ items: { oak_planks: 4 } });
+  ghostBot.craft = async () => {
+    // Always silently ignored by server
+  };
+  const failRes = await executeCraftAction(
+    ghostBot,
+    { item_name: "crafting_table", count: 1 },
+    { verifyCraftSync: true, craftSyncTimeoutMs: 60 },
+  );
+  assert.equal(failRes.ok, false);
+  assert.equal(failRes.reason, "craft_not_confirmed");
+  assert.equal(failRes.crafted_count, 0);
+});
