@@ -566,7 +566,12 @@ export async function executeAcquireAction(
             if (!pickRes.ok) return pickRes;
           }
           const g = await runGather(["coal_ore", "deepslate_coal_ore"], need, "coal_ore");
-          if (g.ok) return { ok: true };
+          if (g.ok) {
+            const afterCoalCounts = countInventoryByName(bot);
+            if ((afterCoalCounts.get("coal") ?? 0) + (afterCoalCounts.get("charcoal") ?? 0) >= desiredCount) {
+              return { ok: true };
+            }
+          }
         }
         // Fallback: smelt charcoal from logs
         return await ensureItem("charcoal", desiredCount, depth + 1);

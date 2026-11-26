@@ -657,10 +657,51 @@ function isReplaceableBlock(block) {
   return REPLACEABLE_BLOCKS.has(name);
 }
 
+const INTERACTIVE_GROUND_BLOCKS = new Set([
+  "crafting_table",
+  "furnace",
+  "blast_furnace",
+  "smoker",
+  "chest",
+  "trapped_chest",
+  "barrel",
+  "ender_chest",
+  "anvil",
+  "chipped_anvil",
+  "damaged_anvil",
+  "enchanting_table",
+  "brewing_stand",
+  "loom",
+  "cartography_table",
+  "smithing_table",
+  "stonecutter",
+  "grindstone",
+  "composter",
+  "lectern",
+  "bell",
+  "lever",
+  "beacon",
+  "dropper",
+  "dispenser",
+  "hopper",
+  "shulker_box",
+]);
+
 function isSafeSolidGround(block) {
   if (!block) return false;
   const name = normalizeCanonicalItemId(block.name);
-  if (!name || UNSAFE_GROUND_BLOCKS.has(name)) return false;
+  if (!name || UNSAFE_GROUND_BLOCKS.has(name) || INTERACTIVE_GROUND_BLOCKS.has(name)) return false;
+  if (
+    name.endsWith("_door") ||
+    name.endsWith("_trapdoor") ||
+    name.endsWith("_fence_gate") ||
+    name.endsWith("_button") ||
+    name.endsWith("_bed") ||
+    name.endsWith("_shulker_box") ||
+    name.endsWith("_sign")
+  ) {
+    return false;
+  }
   if (block.boundingBox && block.boundingBox !== "block") return false;
   return true;
 }

@@ -20,7 +20,7 @@ import {
 } from "./survival.mjs";
 
 const { goals } = pathfinderPkg;
-const { GoalNear } = goals;
+const { GoalBlock, GoalNear } = goals;
 
 export const MIN_HUNT_COUNT = 1;
 export const MAX_HUNT_COUNT = 3;
@@ -557,8 +557,52 @@ function hasCreeperNearby(bot, safeDist = 6) {
   return false;
 }
 
-function findSafePlacementSpot(bot, { requireDouble = false } = {}) {
-  if (!bot || !bot.entity?.position || typeof bot.blockAt !== "function") return null;
+const INTERACTIVE_GROUND_BLOCKS = new Set([
+  "crafting_table",
+  "furnace",
+  "blast_furnace",
+  "smoker",
+  "chest",
+  "trapped_chest",
+  "barrel",
+  "ender_chest",
+  "anvil",
+  "chipped_anvil",
+  "damaged_anvil",
+  "enchanting_table",
+  "brewing_stand",
+  "loom",
+  "cartography_table",
+  "smithing_table",
+  "stonecutter",
+  "grindstone",
+  "composter",
+  "lectern",
+  "bell",
+  "lever",
+  "beacon",
+  "dropper",
+  "dispenser",
+  "hopper",
+  "shulker_box",
+]);
+
+function isInteractiveGroundBlock(name) {
+  if (!name) return false;
+  if (INTERACTIVE_GROUND_BLOCKS.has(name)) return true;
+  return (
+    name.endsWith("_door") ||
+    name.endsWith("_trapdoor") ||
+    name.endsWith("_fence_gate") ||
+    name.endsWith("_button") ||
+    name.endsWith("_bed") ||
+    name.endsWith("_shulker_box") ||
+    name.endsWith("_sign")
+  );
+}
+
+function findSafePlacementSpots(bot, { requireDouble = false } = {}) {
+  if (!bot || !bot.entity?.position || typeof bot.blockAt !== "function") return [];
   const bx = Math.floor(bot.entity.position.x);
   const by = Math.floor(bot.entity.position.y);
   const bz = Math.floor(bot.entity.position.z);
@@ -569,18 +613,26 @@ function findSafePlacementSpot(bot, { requireDouble = false } = {}) {
     const groundBlk = bot.blockAt(vec3(tx, ty - 1, tz));
     if (!targetBlk || !groundBlk) return false;
     if (!REPLACEABLE_BLOCKS.has(normalizeCanonicalItemId(targetBlk.name))) return false;
-    if (UNSAFE_GROUND_BLOCKS.has(normalizeCanonicalItemId(groundBlk.name))) return false;
+    const groundName = normalizeCanonicalItemId(groundBlk.name);
+    if (!groundName || UNSAFE_GROUND_BLOCKS.has(groundName) || isInteractiveGroundBlock(groundName)) {
+      return false;
+    }
+    if (groundBlk.boundingBox && groundBlk.boundingBox !== "block") return false;
     return { targetBlk, groundBlk, pos: [tx, ty, tz] };
   };
 
+  const spots = [];
   for (const [dx, dz] of PLACE_OFFSETS_XZ) {
-    for (const dy of [0, 1, -1]) {
+    for (const dy of [0, -1, 1]) {
       const tx = bx + dx;
       const ty = by + dy;
       const tz = bz + dz;
       const primary = isSpotFreeAndSupported(tx, ty, tz);
       if (!primary) continue;
-      if (!requireDouble) return primary;
+      if (!requireDouble) {
+        spots.push(primary);
+        continue;
+      }
       // Beds require a second adjacent horizontal block (head of bed).
       for (const [hx, hz] of [
         [1, 0],
@@ -589,12 +641,13 @@ function findSafePlacementSpot(bot, { requireDouble = false } = {}) {
         [0, -1],
       ]) {
         if (isSpotFreeAndSupported(tx + hx, ty, tz + hz)) {
-          return primary;
+          spots.push(primary);
+          break;
         }
       }
     }
   }
-  return null;
+  return spots;
 }
 
 async function placeInventoryItemSafely(bot, item, { requireDouble = false, signal = null } = {}) {
@@ -602,18 +655,48 @@ async function placeInventoryItemSafely(bot, item, { requireDouble = false, sign
     return { ok: false, reason: "place_unavailable" };
   }
   if (signal?.aborted) return { ok: false, reason: "mc_goal_cancelled" };
-  const spot = findSafePlacementSpot(bot, { requireDouble });
-  if (!spot) return { ok: false, reason: "no_safe_placement_spot" };
+  const spots = findSafePlacementSpots(bot, { requireDouble });
+  if (spots.length === 0) return { ok: false, reason: "no_safe_placement_spot" };
 
-  try {
-    await bot.equip(item, "hand");
-    await bot.placeBlock(spot.groundBlk, vec3(0, 1, 0));
-  } catch {
-    return { ok: false, reason: "place_failed" };
+  for (const spot of spots.slice(0, 8)) {
+    if (signal?.aborted) return { ok: false, reason: "mc_goal_cancelled" };
+    try {
+      await bot.equip(item, "hand");
+      if (typeof bot.lookAt === "function") {
+        try {
+          await bot.lookAt(vec3(spot.pos[0] + 0.5, spot.pos[1], spot.pos[2] + 0.5), true);
+        } catch {
+          // Ignore lookAt errors
+        }
+      }
+      try {
+        await bot.placeBlock(spot.groundBlk, vec3(0, 1, 0));
+      } catch (firstErr) {
+        const targetName = normalizeCanonicalItemId(spot.targetBlk?.name);
+        if (
+          targetName &&
+          targetName !== "air" &&
+          targetName !== "cave_air" &&
+          targetName !== "void_air" &&
+          typeof bot.dig === "function"
+        ) {
+          await bot.dig(spot.targetBlk);
+          await bot.equip(item, "hand");
+          await bot.placeBlock(spot.groundBlk, vec3(0, 1, 0));
+        } else {
+          throw firstErr;
+        }
+      }
+      const placedBlock =
+        typeof bot.blockAt === "function"
+          ? bot.blockAt(vec3(...spot.pos))
+          : { position: vec3(...spot.pos) };
+      return { ok: true, pos: spot.pos, block: placedBlock };
+    } catch {
+      // Try next valid ground spot
+    }
   }
-  const placedBlock =
-    typeof bot.blockAt === "function" ? bot.blockAt(vec3(...spot.pos)) : { position: vec3(...spot.pos) };
-  return { ok: true, pos: spot.pos, block: placedBlock };
+  return { ok: false, reason: "place_failed" };
 }
 
 export async function executeHuntAction(
@@ -1799,6 +1882,31 @@ export async function executeShelterAction(
     return null;
   };
 
+  const walkToNearbyShelterSpot = async (spot) => {
+    const spotGoal =
+      typeof GoalBlock === "function"
+        ? new GoalBlock(spot.x, spot.y, spot.z)
+        : new GoalNear(spot.x, spot.y, spot.z, 0);
+    const subCtrl = new AbortController();
+    const onParentAbort = () => subCtrl.abort();
+    signal?.addEventListener?.("abort", onParentAbort, { once: true });
+    let subTimer = null;
+    try {
+      await Promise.race([
+        gotoGoal(spotGoal, subCtrl.signal),
+        new Promise((_, reject) => {
+          subTimer = setTimeout(() => {
+            subCtrl.abort();
+            reject(new Error("shelter_spot_walk_timeout"));
+          }, 4_000);
+        }),
+      ]);
+    } finally {
+      if (subTimer) clearTimeout(subTimer);
+      signal?.removeEventListener?.("abort", onParentAbort);
+    }
+  };
+
   let sx = bx;
   let sy = by;
   let sz = bz;
@@ -1809,22 +1917,22 @@ export async function executeShelterAction(
     const nearbyDeep = findNearbySpot(validateDeepShaft);
     if (nearbyDeep) {
       try {
-        await gotoGoal(new GoalNear(nearbyDeep.x, nearbyDeep.y, nearbyDeep.z, 0), signal);
-        const movedPos = bot.entity?.position;
-        if (movedPos && !signal?.aborted) {
-          const nx = Math.floor(movedPos.x);
-          const ny = Math.floor(movedPos.y);
-          const nz = Math.floor(movedPos.z);
-          const recheck = validateDeepShaft(nx, ny, nz);
-          if (recheck.ok) {
-            sx = nx;
-            sy = ny;
-            sz = nz;
-            plan = recheck;
-          }
-        }
+        await walkToNearbyShelterSpot(nearbyDeep);
       } catch {
-        // Fall through to shallow shelter fallback
+        // Check landed position even on partial walk before falling through to shallow fallback
+      }
+      const movedPos = bot.entity?.position;
+      if (movedPos && !signal?.aborted) {
+        const nx = Math.floor(movedPos.x);
+        const ny = Math.floor(movedPos.y);
+        const nz = Math.floor(movedPos.z);
+        const recheck = validateDeepShaft(nx, ny, nz);
+        if (recheck.ok) {
+          sx = nx;
+          sy = ny;
+          sz = nz;
+          plan = recheck;
+        }
       }
     }
   }
@@ -1841,22 +1949,22 @@ export async function executeShelterAction(
       const nearbyShallow = findNearbySpot(validateShallowShaft);
       if (nearbyShallow) {
         try {
-          await gotoGoal(new GoalNear(nearbyShallow.x, nearbyShallow.y, nearbyShallow.z, 0), signal);
-          const movedPos = bot.entity?.position;
-          if (movedPos && !signal?.aborted) {
-            const nx = Math.floor(movedPos.x);
-            const ny = Math.floor(movedPos.y);
-            const nz = Math.floor(movedPos.z);
-            const recheck = validateShallowShaft(nx, ny, nz);
-            if (recheck.ok) {
-              sx = nx;
-              sy = ny;
-              sz = nz;
-              plan = recheck;
-            }
-          }
+          await walkToNearbyShelterSpot(nearbyShallow);
         } catch {
-          // Fall through to failure return
+          // Check landed position even on partial walk
+        }
+        const movedPos = bot.entity?.position;
+        if (movedPos && !signal?.aborted) {
+          const nx = Math.floor(movedPos.x);
+          const ny = Math.floor(movedPos.y);
+          const nz = Math.floor(movedPos.z);
+          const recheck = validateShallowShaft(nx, ny, nz);
+          if (recheck.ok) {
+            sx = nx;
+            sy = ny;
+            sz = nz;
+            plan = recheck;
+          }
         }
       }
     }

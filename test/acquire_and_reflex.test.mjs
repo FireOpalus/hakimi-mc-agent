@@ -1093,4 +1093,68 @@ test("v2.10.5 live-Paper fixes: bounded goals stop background evade pathfinder, 
   assert.equal(dugLogs[0].y, 61);
   assert.equal(dugLogs[0].onGround, true);
   treeRt.stop();
+
+  // 3. place skips interactive ground (crafting_table) and tries next solid ground spot;
+  //    acquire(coal) verifies inventory gain after coal_ore gather and falls back to charcoal when drop lost.
+  const placeBlocks = new Map([
+    ["1,63,0", { name: "crafting_table", boundingBox: "block" }],
+    ["1,64,0", { name: "air", boundingBox: "empty" }],
+    ["-1,63,0", { name: "grass_block", boundingBox: "block" }],
+    ["-1,64,0", { name: "air", boundingBox: "empty" }],
+  ]);
+  const placeBot = makeRichCraftBot({
+    pos: vec3(0.5, 64, 0.5),
+    initialItems: [{ name: "chest", count: 1 }],
+    blocks: placeBlocks,
+  });
+  const placeRefs = [];
+  placeBot.placeBlock = async (ref, face) => {
+    placeRefs.push(ref.name);
+    const px = ref.position.x + face.x;
+    const py = ref.position.y + face.y;
+    const pz = ref.position.z + face.z;
+    placeBlocks.set(`${px},${py},${pz}`, { name: "chest", boundingBox: "block" });
+  };
+  const placeRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => placeBot,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  placeRt.connectBot();
+  placeBot.emit("spawn");
+  const plRes = await placeRt.dispatchGoal({ action_type: "place", item_name: "chest" });
+  assert.equal(plRes.ok, true);
+  assert.deepEqual(placeRefs, ["grass_block"]);
+  assert.deepEqual(plRes.placed_pos, [-1, 64, 0]);
+  placeRt.stop();
+
+  // Lost underwater coal drop -> acquire must verify coal inventory count and fall back to charcoal!
+  const coalBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    initialItems: [
+      { name: "wooden_pickaxe", count: 1 },
+      { name: "oak_log", count: 2 },
+    ],
+    blocks: new Map([["3,62,0", { name: "coal_ore", boundingBox: "block" }]]),
+  });
+  let gatherCoalCalled = 0;
+  const coalRes = await executeAcquireAction(
+    coalBot,
+    { item_name: "coal", count: 1 },
+    {
+      gatherBlocksFn: async (names) => {
+        if (names.includes("coal_ore")) {
+          gatherCoalCalled += 1;
+          // Simulates digging coal_ore but losing the drop (coal stays 0 in inventory)
+          return { ok: true, collected_count: 1, block: "coal_ore" };
+        }
+        return { ok: false, reason: "block_not_found" };
+      },
+    },
+  );
+  assert.equal(gatherCoalCalled, 1);
+  // Must NOT falsely return ok=true when coal=0; falls back toward charcoal/furnace
+  assert.equal(coalRes.ok, false);
 });

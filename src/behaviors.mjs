@@ -2485,7 +2485,10 @@ export class McRuntime {
       let subTimer = null;
       try {
         await Promise.race([
-          this._gotoGoal(new GoalNear(target[0], target[1], target[2], 1), subCtrl.signal),
+          this._gotoGoal(new GoalNear(target[0], target[1], target[2], 1), subCtrl.signal, {
+            escalate: false,
+            profileOpts: { thinkTimeout: 800, searchRadius: 12 },
+          }),
           new Promise((resolve) => {
             subTimer = setTimeout(() => {
               subCtrl.abort();
@@ -2607,39 +2610,50 @@ export class McRuntime {
           buriedCandidates.push(entry);
         }
       }
-      // For tree logs, gently prefer trunk-base logs over upper canopy logs so hillside bots
-      // walk to the trunk base on ground instead of climbing onto tree canopies.
+      // Gently prefer dry candidates over submerged blocks, and trunk-base logs over upper canopy logs
+      // so hillside/riverside bots gather cleanly on dry ground instead of climbing canopies or diving.
       const candidatePool = exposedCandidates.length > 0 ? exposedCandidates : buriedCandidates;
       if (
         candidatePool.length > 1 &&
         bot.entity?.position &&
-        typeof bot.blockAt === "function" &&
-        candidatePool.some((e) => String(e.blk?.name || rawBlock).endsWith("_log"))
+        typeof bot.blockAt === "function"
       ) {
         const originPos = bot.entity.position;
         const botY = Math.floor(originPos.y ?? 0);
-        const scoreLogCandidate = (entry) => {
+        const isWaterName = (n) => n === "water" || n === "flowing_water" || n === "bubble_column";
+        const scoreCandidate = (entry) => {
           const [cx, cy, cz] = entry.coords;
           const dist3d = Math.hypot(
             cx + 0.5 - (originPos.x ?? 0),
             cy + 0.5 - (originPos.y ?? 0),
             cz + 0.5 - (originPos.z ?? 0),
           );
-          const name = String(entry.blk?.name || rawBlock);
-          if (!name.endsWith("_log")) return dist3d;
-          let below = null;
+          let penalty = 0;
           try {
-            below = bot.blockAt(vec3(Math.floor(cx), Math.floor(cy) - 1, Math.floor(cz)));
+            const above = bot.blockAt(vec3(Math.floor(cx), Math.floor(cy) + 1, Math.floor(cz)));
+            if (above && isWaterName(above.name)) {
+              penalty += 8.0;
+            }
           } catch {
-            below = null;
+            // Ignore block lookup errors
           }
-          const hasLogBelow = Boolean(
-            below && typeof below.name === "string" && below.name.endsWith("_log"),
-          );
-          const canopyPenalty = Math.floor(cy) > botY + 2 ? 3.0 : 0;
-          return dist3d + (hasLogBelow ? 4.5 : 0) + canopyPenalty;
+          const name = String(entry.blk?.name || rawBlock);
+          if (name.endsWith("_log")) {
+            let below = null;
+            try {
+              below = bot.blockAt(vec3(Math.floor(cx), Math.floor(cy) - 1, Math.floor(cz)));
+            } catch {
+              below = null;
+            }
+            const hasLogBelow = Boolean(
+              below && typeof below.name === "string" && below.name.endsWith("_log"),
+            );
+            const canopyPenalty = Math.floor(cy) > botY + 2 ? 3.0 : 0;
+            penalty += (hasLogBelow ? 4.5 : 0) + canopyPenalty;
+          }
+          return dist3d + penalty;
         };
-        candidatePool.sort((a, b) => scoreLogCandidate(a) - scoreLogCandidate(b));
+        candidatePool.sort((a, b) => scoreCandidate(a) - scoreCandidate(b));
       }
       const chosen = candidatePool[0] || null;
       if (!chosen) {
