@@ -261,6 +261,77 @@ export function collectEquipmentSnapshot(bot) {
   return eq;
 }
 
+const INVENTORY_PRIORITY_EXACT = new Set([
+  "shield",
+  "bow",
+  "crossbow",
+  "trident",
+  "mace",
+  "arrow",
+  "spectral_arrow",
+  "shears",
+  "flint_and_steel",
+  "fishing_rod",
+  "crafting_table",
+  "furnace",
+  "smoker",
+  "blast_furnace",
+  "chest",
+  "barrel",
+  "torch",
+  "soul_torch",
+  "lantern",
+  "soul_lantern",
+  "bucket",
+  "water_bucket",
+  "lava_bucket",
+  "milk_bucket",
+  "stick",
+  "coal",
+  "charcoal",
+  "raw_iron",
+  "iron_ingot",
+  "raw_gold",
+  "gold_ingot",
+  "diamond",
+  "emerald",
+  "netherite_ingot",
+  "netherite_scrap",
+  "lapis_lazuli",
+  "redstone",
+  "chicken",
+  "wheat",
+  "wool",
+  "white_wool",
+  "string",
+  "leather",
+  "compass",
+  "clock",
+]);
+
+export function isPriorityInventoryItem(name) {
+  if (!name) return false;
+  if (
+    INVENTORY_PRIORITY_EXACT.has(name) ||
+    Object.hasOwn(SAFE_FOOD_SCORES, name) ||
+    Object.hasOwn(WEAPON_SCORES, name) ||
+    ARMOR_RE.test(name)
+  ) {
+    return true;
+  }
+  return (
+    name.endsWith("_pickaxe") ||
+    name.endsWith("_axe") ||
+    name.endsWith("_shovel") ||
+    name.endsWith("_sword") ||
+    name.endsWith("_hoe") ||
+    name.endsWith("_bed") ||
+    name.endsWith("_wool") ||
+    name.endsWith("_log") ||
+    name.endsWith("_planks")
+  );
+}
+
 export function collectInventorySnapshot(bot) {
   const equipment = collectEquipmentSnapshot(bot);
   if (!bot || !bot.inventory || typeof bot.inventory !== "object") {
@@ -283,9 +354,18 @@ export function collectInventorySnapshot(bot) {
     counts.set(name, Math.min(99999, (counts.get(name) ?? 0) + add));
   }
 
-  const sorted = Array.from(counts.entries())
+  // Select Top 16 with survival-critical items (tools/weapons/armor/food/stations/key mats)
+  // never evicted by 1-count flowers/seeds/buttons, then display sorted by count descending.
+  const selected = Array.from(counts.entries())
+    .sort((a, b) => {
+      const pa = isPriorityInventoryItem(a[0]) ? 0 : 1;
+      const pb = isPriorityInventoryItem(b[0]) ? 0 : 1;
+      return pa - pb || b[1] - a[1] || a[0].localeCompare(b[0]);
+    })
+    .slice(0, 16);
+
+  const sorted = selected
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .slice(0, 16)
     .map(([name, count]) => `${name}:${count}`);
 
   let freeSlots = null;

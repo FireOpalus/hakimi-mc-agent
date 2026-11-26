@@ -245,6 +245,51 @@ test("inventory snapshot merges stacks, caps at Top 16, computes free_slots, and
   assert.ok(!serialized.includes("Anvil"));
   assert.ok(!serialized.includes("Crown"));
   assert.ok(!serialized.includes("CQ:"));
+
+  // Survival-critical 1-count tools/weapons/stations/food are never evicted by flowers/junk
+  const crowdedItems = [
+    { name: "cobblestone", count: 90 },
+    { name: "dirt", count: 73 },
+    { name: "leaf_litter", count: 38 },
+    { name: "granite", count: 16 },
+    { name: "rotten_flesh", count: 7 },
+    { name: "wheat_seeds", count: 4 },
+    { name: "dandelion", count: 2 },
+    { name: "allium", count: 1 },
+    { name: "azure_bluet", count: 1 },
+    { name: "bone", count: 1 },
+    { name: "cornflower", count: 1 },
+    { name: "oak_button", count: 1 },
+    { name: "oak_pressure_plate", count: 1 },
+    { name: "oxeye_daisy", count: 1 },
+    { name: "poppy", count: 1 },
+    { name: "oak_planks", count: 3 },
+    { name: "stick", count: 1 },
+    { name: "stone_sword", count: 1 },
+    { name: "stone_pickaxe", count: 1 },
+    { name: "stone_axe", count: 1 },
+    { name: "crafting_table", count: 1 },
+    { name: "cooked_porkchop", count: 2 },
+  ];
+  const crowdedBot = createSurvivalMockBot({ items: crowdedItems });
+  const crowdedSnap = collectInventorySnapshot(crowdedBot);
+  assert.equal(crowdedSnap.inventory_summary.length, 16);
+  for (const mustKeep of [
+    "stone_sword:1",
+    "stone_pickaxe:1",
+    "stone_axe:1",
+    "crafting_table:1",
+    "cooked_porkchop:2",
+    "oak_planks:3",
+    "stick:1",
+  ]) {
+    assert.ok(
+      crowdedSnap.inventory_summary.includes(mustKeep),
+      `expected ${mustKeep} retained in Top 16, got ${JSON.stringify(crowdedSnap.inventory_summary)}`,
+    );
+  }
+  assert.ok(!crowdedSnap.inventory_summary.includes("poppy:1"));
+  assert.ok(!crowdedSnap.inventory_summary.includes("oak_button:1"));
 });
 
 test("auto-eat strictly refuses all 6 toxic foods and respects trigger thresholds", async () => {
