@@ -73,13 +73,18 @@ import {
   MELEE_FLEE_DISTANCE,
   RANGED_EVADE_RADIUS,
   RANGED_FLEE_DISTANCE,
-  RANGED_HOSTILE_MOBS,
+  WATER_BLOCK_NAMES,
   applyNoDigMovements,
   computeRetreatTarget,
   createCombatState,
+  findCriticalGoalInterruptThreat,
   findNearestCreeper,
+  hasNearbyHostileOrProjectile,
   isEndermanProvoked,
+  isRangedHostileEntity,
   lowerShield,
+  observeEndermanBehavior,
+  recordBotHurtEndermanAggro,
   runGuardCombatStep,
   updateEvadeShieldDefense,
 } from "./combat.mjs";
@@ -88,6 +93,74 @@ export { HOSTILE_MOBS };
 
 const { goals } = pathfinderPkg;
 const { GoalFollow, GoalNear, GoalNearXZ } = goals;
+
+const SURVIVAL_INTERRUPTIBLE_GOALS = new Set([
+  "goto",
+  "explore",
+  "gather",
+  "mine",
+  "craft",
+  "smelt",
+  "hunt",
+  "acquire",
+  "follow",
+  "sleep",
+  "chest",
+  "place",
+  "give",
+]);
+
+const LIQUID_OR_AIR_GROUND = new Set([
+  "water",
+  "flowing_water",
+  "bubble_column",
+  "lava",
+  "flowing_lava",
+  "air",
+  "cave_air",
+  "void_air",
+]);
+
+const DRY_AIR_PASSABLE = new Set([
+  "air",
+  "cave_air",
+  "void_air",
+  "short_grass",
+  "grass",
+  "tall_grass",
+  "short_dry_grass",
+  "tall_dry_grass",
+  "fern",
+  "large_fern",
+  "snow",
+  "leaf_litter",
+  "pink_petals",
+  "wildflowers",
+  "dandelion",
+  "poppy",
+]);
+
+const SKY_TRANSPARENT_BLOCKS = new Set([
+  "air",
+  "cave_air",
+  "void_air",
+  "water",
+  "flowing_water",
+  "bubble_column",
+  "glass",
+  "tinted_glass",
+  "ice",
+  "snow",
+  "vine",
+  "glow_lichen",
+  "short_grass",
+  "grass",
+  "tall_grass",
+  "torch",
+  "wall_torch",
+  "soul_torch",
+  "soul_wall_torch",
+]);
 
 export const ALLOWED_GOAL_ACTIONS = new Set([
   "status",
@@ -325,6 +398,9 @@ export class McRuntime {
     this.freeSlots = null;
     this.safeFoodCount = null;
     this.inWater = false;
+    this.inShelter = false;
+    this.skyExposed = null;
+    this.skyLight = null;
     this.combatMode = config.mcCombatMode === "guard" ? "guard" : "evade";
     this.guardTarget = "";
     this.timeOfDay = "";
@@ -348,6 +424,8 @@ export class McRuntime {
     this._soloSinceMs = null;
     this._consecutiveReconnectFails = 0;
     this._activeGoalCancel = null;
+    this._activeGoalMeta = null;
+    this._lastGoalThreatCheckMs = 0;
     this._prevHealth = null;
     this._lastChatAtMs = -Infinity;
     this._milestoneCooldowns = new Map();
@@ -491,6 +569,9 @@ export class McRuntime {
       free_slots: this.connected ? this.freeSlots : null,
       safe_food_count: this.connected ? this.safeFoodCount : null,
       in_water: this.connected ? Boolean(this.inWater) : false,
+      in_shelter: this.connected ? Boolean(this._shelterState.active) : false,
+      sky_exposed: this.connected ? this.skyExposed : null,
+      sky_light: this.connected ? this.skyLight : null,
       combat_mode: this.combatMode,
       guard_target: this._resolveGuardTargetName(),
       time_of_day: this.connected ? this.timeOfDay : "",
@@ -586,6 +667,11 @@ export class McRuntime {
     this.freeSlots = invSnap.free_slots;
     this.safeFoodCount = bot.inventory ? countSafeFood(bot) : null;
     this.inWater = this._isBotInWater(bot);
+    this.inShelter = Boolean(this._shelterState.active);
+    const sky = this._computeSkyTelemetry(bot);
+    this.skyExposed = sky.skyExposed;
+    this.skyLight = sky.skyLight;
+    observeEndermanBehavior(bot, this._combatState, { nowMs: this.nowFn() });
     this.timeOfDay = this._computeTimeOfDay(bot);
     this.nearbyResources = this._collectNearbyResources(bot, 16);
     this.nearbyEntities = this._collectNearbyEntities(bot);
@@ -598,34 +684,181 @@ export class McRuntime {
     }
   }
 
-  _isBotInWater(bot) {
-    if (!bot) return false;
-    if (this._waterFloatState?.floating || bot.entity?.isInWater) return true;
-    const p = bot.entity?.position;
-    if (p && typeof bot.blockAt === "function") {
+  _computeSkyTelemetry(bot) {
+    if (!bot || !this.connected || !bot.entity?.position) {
+      return { skyExposed: null, skyLight: null };
+    }
+    const dim = String(this.dimension || bot.game?.dimension || "").toLowerCase();
+    if (dim && !dim.includes("overworld")) {
+      return { skyExposed: null, skyLight: null };
+    }
+    const p = bot.entity.position;
+    const bx = Math.floor(p.x ?? 0);
+    const by = Math.floor(p.y ?? 0);
+    const bz = Math.floor(p.z ?? 0);
+    let skyLight = null;
+
+    if (typeof bot.blockAt === "function") {
       try {
-        const blk = bot.blockAt(vec3(Math.floor(p.x ?? 0), Math.floor(p.y ?? 0), Math.floor(p.z ?? 0)));
-        const name = String(blk?.name || "").toLowerCase();
-        if (name === "water" || name === "flowing_water" || name === "bubble_column") {
-          return true;
+        const headBlk = bot.blockAt(vec3(bx, by + 1, bz));
+        const feetBlk = bot.blockAt(vec3(bx, by, bz));
+        const rawSky =
+          typeof headBlk?.skyLight === "number" && Number.isFinite(headBlk.skyLight)
+            ? headBlk.skyLight
+            : typeof feetBlk?.skyLight === "number" && Number.isFinite(feetBlk.skyLight)
+              ? feetBlk.skyLight
+              : null;
+        if (rawSky !== null) {
+          skyLight = Math.max(0, Math.min(15, Math.floor(rawSky)));
         }
       } catch {
         // Ignore partial mock errors
       }
     }
-    return false;
+
+    if (this._shelterState.active) {
+      return { skyExposed: false, skyLight };
+    }
+
+    const isSkyTransparent = (blk) => {
+      if (!blk) return true;
+      if (blk.boundingBox === "empty") return true;
+      const name = normalizeCanonicalItemId(blk.name);
+      if (!name || SKY_TRANSPARENT_BLOCKS.has(name)) return true;
+      return (
+        name.endsWith("_leaves") ||
+        name.endsWith("_glass") ||
+        name.endsWith("_glass_pane") ||
+        name.endsWith("_sapling")
+      );
+    };
+
+    const raycastHasOpaqueCeiling = () => {
+      if (typeof bot.blockAt !== "function") return null;
+      let sawBlock = false;
+      const maxY = Math.min(320, by + 20);
+      for (let y = by + 2; y <= maxY; y += 1) {
+        try {
+          const blk = bot.blockAt(vec3(bx, y, bz));
+          if (!blk) continue;
+          sawBlock = true;
+          if (!isSkyTransparent(blk)) {
+            return true;
+          }
+        } catch {
+          // Ignore unloaded chunk lookup
+        }
+      }
+      return sawBlock ? false : null;
+    };
+
+    if (skyLight !== null) {
+      if (skyLight >= 12) return { skyExposed: true, skyLight };
+      if (skyLight <= 4) return { skyExposed: false, skyLight };
+      const roofed = raycastHasOpaqueCeiling();
+      return { skyExposed: roofed === null ? true : !roofed, skyLight };
+    }
+
+    const roofed = raycastHasOpaqueCeiling();
+    return { skyExposed: roofed === null ? null : !roofed, skyLight: null };
   }
 
-  _findNearestDryLand(bot, maxRadius = 20) {
+  _isBotInWater(bot) {
+    if (!bot) return false;
+    const p = bot.entity?.position;
+    if (p && typeof bot.blockAt === "function") {
+      try {
+        const bx = Math.floor(p.x ?? 0);
+        const by = Math.floor(p.y ?? 0);
+        const bz = Math.floor(p.z ?? 0);
+        const feet = bot.blockAt(vec3(bx, by, bz));
+        const feetName = normalizeCanonicalItemId(feet?.name);
+        if (WATER_BLOCK_NAMES.has(feetName)) {
+          return true;
+        }
+        const below = bot.blockAt(vec3(bx, by - 1, bz));
+        const belowName = normalizeCanonicalItemId(below?.name);
+        if (
+          feet &&
+          (DRY_AIR_PASSABLE.has(feetName) || feet.boundingBox === "empty") &&
+          below &&
+          below.boundingBox !== "empty" &&
+          belowName &&
+          !LIQUID_OR_AIR_GROUND.has(belowName)
+        ) {
+          return false;
+        }
+      } catch {
+        // Ignore partial mock errors
+      }
+    }
+    return Boolean(this._waterFloatState?.floating || bot.entity?.isInWater);
+  }
+
+  _checkColumnDryness(bot, tx, tz, refY = 64) {
+    const baseY = Math.floor(Number.isFinite(refY) ? refY : 64);
+    if (!bot || typeof bot.blockAt !== "function") {
+      return { known: false, dry: true, liquid: false, y: baseY };
+    }
+    let sawLiquid = false;
+    let sawAnyBlock = false;
+    for (let dy = 4; dy >= -4; dy -= 1) {
+      const ty = baseY + dy;
+      let ground;
+      let feet;
+      let head;
+      try {
+        ground = bot.blockAt(vec3(tx, ty - 1, tz));
+        feet = bot.blockAt(vec3(tx, ty, tz));
+        head = bot.blockAt(vec3(tx, ty + 1, tz));
+      } catch {
+        continue;
+      }
+      if (!ground && !feet && !head) continue;
+      sawAnyBlock = true;
+      const gName = normalizeCanonicalItemId(ground?.name);
+      const fName = normalizeCanonicalItemId(feet?.name);
+      const hName = normalizeCanonicalItemId(head?.name);
+      if (
+        WATER_BLOCK_NAMES.has(fName) ||
+        WATER_BLOCK_NAMES.has(hName) ||
+        WATER_BLOCK_NAMES.has(gName) ||
+        fName === "lava" ||
+        fName === "flowing_lava" ||
+        gName === "lava" ||
+        gName === "flowing_lava"
+      ) {
+        sawLiquid = true;
+      }
+      if (
+        gName &&
+        !LIQUID_OR_AIR_GROUND.has(gName) &&
+        !HAZARD_AVOID_BLOCKS.has(gName) &&
+        ground?.boundingBox !== "empty" &&
+        (!feet || DRY_AIR_PASSABLE.has(fName)) &&
+        (!head || DRY_AIR_PASSABLE.has(hName))
+      ) {
+        return { known: true, dry: true, liquid: false, y: ty };
+      }
+    }
+    if (sawLiquid) {
+      return { known: true, dry: false, liquid: true, y: null };
+    }
+    if (sawAnyBlock) {
+      return { known: true, dry: false, liquid: false, y: null };
+    }
+    return { known: false, dry: true, liquid: false, y: baseY };
+  }
+
+  _findDryLandCandidates(bot, maxRadius = 27, maxCandidates = 3) {
     const origin = bot?.entity?.position;
-    if (!origin || typeof bot.blockAt !== "function") return null;
+    if (!origin || typeof bot.blockAt !== "function") return [];
     const ox = Math.floor(origin.x ?? 0);
     const oy = Math.floor(origin.y ?? 64);
     const oz = Math.floor(origin.z ?? 0);
-    const waterNames = new Set(["water", "flowing_water", "bubble_column", "lava", "flowing_lava", "air", "cave_air", "void_air"]);
-    const airNames = new Set(["air", "cave_air", "void_air", "short_grass", "grass", "tall_grass", "snow", "leaf_litter"]);
-    let best = null;
-    for (let r = 3; r <= maxRadius; r += 3) {
+    const chosen = [];
+    for (let r = 3; r <= maxRadius && chosen.length < maxCandidates; r += 3) {
+      const ringHits = [];
       for (let step = 0; step < 12; step += 1) {
         const angle = (step * Math.PI * 2) / 12;
         const tx = Math.round(ox + Math.cos(angle) * r);
@@ -635,27 +868,37 @@ export class McRuntime {
           const ground = bot.blockAt(vec3(tx, ty - 1, tz));
           const feet = bot.blockAt(vec3(tx, ty, tz));
           const head = bot.blockAt(vec3(tx, ty + 1, tz));
-          const gName = String(ground?.name || "").toLowerCase();
-          const fName = String(feet?.name || "").toLowerCase();
-          const hName = String(head?.name || "").toLowerCase();
+          const gName = normalizeCanonicalItemId(ground?.name);
+          const fName = normalizeCanonicalItemId(feet?.name);
+          const hName = normalizeCanonicalItemId(head?.name);
           if (
             gName &&
-            !waterNames.has(gName) &&
+            !LIQUID_OR_AIR_GROUND.has(gName) &&
+            !HAZARD_AVOID_BLOCKS.has(gName) &&
             ground?.boundingBox !== "empty" &&
-            airNames.has(fName) &&
-            airNames.has(hName)
+            DRY_AIR_PASSABLE.has(fName) &&
+            DRY_AIR_PASSABLE.has(hName)
           ) {
             const dist = Math.hypot(tx - ox, tz - oz);
-            if (!best || dist < best.dist) {
-              best = { x: tx, y: ty, z: tz, dist };
-            }
+            ringHits.push({ x: tx, y: ty, z: tz, dist });
             break;
           }
         }
       }
-      if (best) return best;
+      ringHits.sort((a, b) => a.dist - b.dist);
+      for (const hit of ringHits) {
+        if (chosen.length >= maxCandidates) break;
+        const tooClose = chosen.some((c) => Math.hypot(c.x - hit.x, c.z - hit.z) < 4);
+        if (!tooClose) {
+          chosen.push(hit);
+        }
+      }
     }
-    return best;
+    return chosen;
+  }
+
+  _findNearestDryLand(bot, maxRadius = 27) {
+    return this._findDryLandCandidates(bot, maxRadius, 1)[0] || null;
   }
 
   _syncSoloClock(bot = this.bot) {
@@ -719,7 +962,7 @@ export class McRuntime {
       const rawName =
         ent.type === "player" && ent.username
           ? ent.username
-          : entNameLower === "enderman" && !isEndermanProvoked(ent)
+          : entNameLower === "enderman" && !isEndermanProvoked(ent, this._combatState, this.nowFn())
             ? "enderman(neutral)"
             : ent.name || ent.displayName || ent.type || "";
       const cleanName = sanitizeMcText(rawName, 24);
@@ -907,6 +1150,18 @@ export class McRuntime {
       }
 
       updateWaterFloatControl(bot, this._waterFloatState);
+      const nowTickMs = this.nowFn();
+      observeEndermanBehavior(bot, this._combatState, { nowMs: nowTickMs });
+      if (this._activeGoalMeta?.interruptable) {
+        this._checkActiveGoalThreatInterrupt(bot, nowTickMs);
+      } else if (
+        !this._activeGoalCancel &&
+        !this.config.mcCompanionMode &&
+        this.combatMode !== "guard" &&
+        (this._evadePlan || this._combatState.shieldRaised)
+      ) {
+        await this._runSurvivalDefenseStep(bot, nowTickMs);
+      }
 
       if (
         this._shelterState.active &&
@@ -1149,7 +1404,7 @@ export class McRuntime {
     return best;
   }
 
-  _findNearestHostile(bot, maxDist = MELEE_EVADE_RADIUS) {
+  _findNearestHostile(bot, maxDist = MELEE_EVADE_RADIUS, nowMs = this.nowFn()) {
     if (!bot?.entity?.position) return null;
     const origin = bot.entity.position;
     let best = null;
@@ -1157,7 +1412,7 @@ export class McRuntime {
       if (!ent || ent === bot.entity || !ent.position) continue;
       const name = String(ent.name || "").toLowerCase();
       if (!HOSTILE_MOBS.has(name)) continue;
-      if (name === "enderman" && !isEndermanProvoked(ent)) continue;
+      if (name === "enderman" && !isEndermanProvoked(ent, this._combatState, nowMs)) continue;
       const dist = this._distanceBetween(origin, ent.position);
       if (dist <= maxDist && (!best || dist < best.dist)) {
         best = { entity: ent, name, dist };
@@ -1166,7 +1421,7 @@ export class McRuntime {
     return best;
   }
 
-  _findEvadeThreats(bot) {
+  _findEvadeThreats(bot, nowMs = this.nowFn()) {
     if (!bot?.entity?.position) return null;
     const origin = bot.entity.position;
     const threats = [];
@@ -1177,10 +1432,10 @@ export class McRuntime {
       if (!ent || ent === bot.entity || !ent.position) continue;
       const name = String(ent.name || "").toLowerCase();
       if (!HOSTILE_MOBS.has(name)) continue;
-      if (name === "enderman" && !isEndermanProvoked(ent)) continue;
-      const isRanged = RANGED_HOSTILE_MOBS.has(name);
-      const radius = isRanged ? RANGED_EVADE_RADIUS : MELEE_EVADE_RADIUS;
+      if (name === "enderman" && !isEndermanProvoked(ent, this._combatState, nowMs)) continue;
       const dist = this._distanceBetween(origin, ent.position);
+      const isRanged = isRangedHostileEntity(ent, bot, dist);
+      const radius = isRanged ? RANGED_EVADE_RADIUS : MELEE_EVADE_RADIUS;
       if (dist <= radius) {
         const entry = { entity: ent, name, dist, isRanged };
         threats.push(entry);
@@ -1206,24 +1461,35 @@ export class McRuntime {
     };
   }
 
-  _computeFleeTarget(origin, threatInfo, allowed = null, angleDeg = 0) {
+  _computeFleeTarget(origin, threatInfo, allowed = null, angleDeg = 0, bot = this.bot) {
     const fleeDist = threatInfo.hasRanged ? RANGED_FLEE_DISTANCE : MELEE_FLEE_DISTANCE;
-    const dx = (origin.x ?? 0) - (threatInfo.centroid.x ?? 0);
-    const dz = (origin.z ?? 0) - (threatInfo.centroid.z ?? 0);
+    const ox = origin.x ?? 0;
+    const oy = origin.y ?? 64;
+    const oz = origin.z ?? 0;
+    const dx = ox - (threatInfo.centroid.x ?? 0);
+    const dz = oz - (threatInfo.centroid.z ?? 0);
     const len = Math.hypot(dx, dz);
-    let dirX = len > 0.05 ? dx / len : 1;
-    let dirZ = len > 0.05 ? dz / len : 0;
-    if (angleDeg !== 0) {
-      const rad = (angleDeg * Math.PI) / 180;
-      const cos = Math.cos(rad);
-      const sin = Math.sin(rad);
-      const rx = dirX * cos - dirZ * sin;
-      const rz = dirX * sin + dirZ * cos;
-      dirX = rx;
-      dirZ = rz;
-    }
-    let tx = Math.round((origin.x ?? 0) + dirX * fleeDist);
-    let tz = Math.round((origin.z ?? 0) + dirZ * fleeDist);
+    const baseDirX = len > 0.05 ? dx / len : 1;
+    const baseDirZ = len > 0.05 ? dz / len : 0;
+
+    const projectDir = (deg, dist) => {
+      let dirX = baseDirX;
+      let dirZ = baseDirZ;
+      if (deg !== 0) {
+        const rad = (deg * Math.PI) / 180;
+        const cos = Math.cos(rad);
+        const sin = Math.sin(rad);
+        dirX = baseDirX * cos - baseDirZ * sin;
+        dirZ = baseDirX * sin + baseDirZ * cos;
+      }
+      return {
+        tx: Math.round(ox + dirX * dist),
+        tz: Math.round(oz + dirZ * dist),
+      };
+    };
+
+    let { tx, tz } = projectDir(angleDeg, fleeDist);
+    let pickedAllowed = false;
     if (
       angleDeg === 0 &&
       allowed &&
@@ -1231,10 +1497,361 @@ export class McRuntime {
       this._distanceBetween(allowed.player.entity.position, threatInfo.nearest.entity.position) >
         threatInfo.nearest.dist + 2
     ) {
-      tx = Math.round(allowed.player.entity.position.x ?? tx);
-      tz = Math.round(allowed.player.entity.position.z ?? tz);
+      const ax = Math.round(allowed.player.entity.position.x ?? tx);
+      const az = Math.round(allowed.player.entity.position.z ?? tz);
+      const allowedCol = bot ? this._checkColumnDryness(bot, ax, az, oy) : { dry: true };
+      if (allowedCol.dry) {
+        tx = ax;
+        tz = az;
+        pickedAllowed = true;
+      }
     }
+
+    if (!pickedAllowed && bot && typeof bot.blockAt === "function") {
+      const primaryCol = this._checkColumnDryness(bot, tx, tz, oy);
+      if (!primaryCol.dry) {
+        const probeAngles = [0, 30, -30, 60, -60, 90, -90, 120, -120];
+        const probeDists = [
+          fleeDist,
+          Math.max(8, fleeDist - 6),
+          Math.max(6, Math.round(fleeDist * 0.5)),
+        ];
+        let foundDry = null;
+        outer: for (const dist of probeDists) {
+          for (const offsetDeg of probeAngles) {
+            const cand = projectDir(angleDeg + offsetDeg, dist);
+            const col = this._checkColumnDryness(bot, cand.tx, cand.tz, oy);
+            if (col.dry && !col.liquid) {
+              foundDry = cand;
+              break outer;
+            }
+          }
+        }
+        if (foundDry) {
+          tx = foundDry.tx;
+          tz = foundDry.tz;
+        } else if (this._isBotInWater(bot)) {
+          const dryShore = this._findNearestDryLand(bot, 27);
+          if (
+            dryShore &&
+            (!threatInfo.nearest?.entity?.position ||
+              this._distanceBetween(dryShore, threatInfo.nearest.entity.position) > 4.5)
+          ) {
+            tx = dryShore.x;
+            tz = dryShore.z;
+          }
+        }
+      }
+    }
+
     return { tx, tz, fleeDist };
+  }
+
+  _isDefenseActivityActive() {
+    return Boolean(
+      this._evadePlan ||
+        this._combatState.retreating ||
+        this._combatState.shieldRaised ||
+        this._combatState.activeTargetId !== null ||
+        this.activity === "远离苦力怕" ||
+        this.activity === "躲避怪物" ||
+        this.activity === "举盾躲避",
+    );
+  }
+
+  _interruptActiveGoalForSurvival(
+    reason,
+    { threatMob = "", nowMs = this.nowFn(), runDefense = true } = {},
+  ) {
+    const meta = this._activeGoalMeta;
+    if (
+      !meta ||
+      !meta.interruptable ||
+      !this.connected ||
+      !this.bot ||
+      this.paused ||
+      this._stopped ||
+      this._shelterState.active
+    ) {
+      return false;
+    }
+    const didInterrupt = meta.interrupt(reason, { threatMob });
+    if (!didInterrupt) return false;
+    if (runDefense) {
+      void this._runImmediateSurvivalDefense(nowMs);
+    }
+    return true;
+  }
+
+  async _runImmediateSurvivalDefense(nowMs = this.nowFn()) {
+    const bot = this.bot;
+    if (!this.connected || !bot || this.paused || this._stopped || this._activeGoalCancel) {
+      return;
+    }
+    if (this._companionTickRunning) return;
+    this._companionTickRunning = true;
+    try {
+      await this._runSurvivalDefenseStep(bot, nowMs);
+    } catch {
+      // Never crash survival defense response
+    } finally {
+      this._companionTickRunning = false;
+    }
+  }
+
+  _checkActiveGoalThreatInterrupt(bot, nowMs = this.nowFn(), { runDefense = true } = {}) {
+    if (
+      !bot ||
+      !this.connected ||
+      this.paused ||
+      this._stopped ||
+      this._shelterState.active ||
+      !this._activeGoalMeta?.interruptable
+    ) {
+      return false;
+    }
+    observeEndermanBehavior(bot, this._combatState, { nowMs });
+    const threat = findCriticalGoalInterruptThreat(bot, {
+      combatState: this._combatState,
+      nowMs,
+    });
+    if (!threat) return false;
+    return this._interruptActiveGoalForSurvival("interrupted_by_threat", {
+      threatMob: threat.name,
+      nowMs,
+      runDefense,
+    });
+  }
+
+  _handleDamageInterrupt(
+    bot,
+    { damage = 0, newHealth = null, attacker = null, fromHurtEvent = false } = {},
+  ) {
+    if (!bot || !this.connected || this.paused || this._stopped) return false;
+    const nowMs = this.nowFn();
+    this._combatState.lastDamageAtMs = nowMs;
+    recordBotHurtEndermanAggro(bot, this._combatState, { nowMs, attacker });
+    observeEndermanBehavior(bot, this._combatState, { nowMs });
+
+    if (!this._activeGoalMeta?.interruptable || this._shelterState.active) {
+      return false;
+    }
+    const nearbyThreat = hasNearbyHostileOrProjectile(bot, {
+      combatState: this._combatState,
+      nowMs,
+    });
+    const hazard = detectEnvironmentalHazard(bot);
+    const attackerName = attacker ? normalizeCanonicalItemId(String(attacker.name || "")) : "";
+    const isFalling = typeof bot.entity?.velocity?.y === "number" && bot.entity.velocity.y <= -0.45;
+    const isStarving = typeof this.food === "number" && this.food <= 0;
+    const nonEnvSignificantHit =
+      hazard.severity === 0 &&
+      !isFalling &&
+      !isStarving &&
+      (fromHurtEvent || damage >= 2 || (newHealth !== null && newHealth <= 10));
+
+    if (!attackerName && !nearbyThreat && !nonEnvSignificantHit) {
+      return false;
+    }
+
+    return this._interruptActiveGoalForSurvival("interrupted_by_damage", {
+      threatMob: attackerName || nearbyThreat?.name || "",
+      nowMs,
+      runDefense: true,
+    });
+  }
+
+  async _runSurvivalDefenseStep(bot, nowMs = this.nowFn()) {
+    const origin = bot?.entity?.position;
+    if (!origin) return { handled: false };
+    if (this._shelterState.active) {
+      this.activity = "掩体避险";
+      return { handled: true };
+    }
+
+    observeEndermanBehavior(bot, this._combatState, { nowMs });
+    const allowed =
+      this.combatMode === "guard"
+        ? this._findGuardedPlayer(bot)
+        : this._findNearestAllowedPlayer(bot);
+
+    if (this.combatMode === "guard") {
+      const combatRes = await runGuardCombatStep({
+        bot,
+        combatState: this._combatState,
+        guardedPlayer: allowed?.player ?? null,
+        health: this.health,
+        food: this.food,
+        nowMs,
+        autoEquip: this.config.mcAutoEquip !== false,
+        eating: this._eatingLock.eating,
+        lookAtEntityFn: (b, e) => this._lookAtEntity(b, e),
+        onNeedHealEat: () => this._triggerUrgentEat(),
+        onCreeperAlert: (creeper) => this._handleCreeperAlert(creeper, allowed?.player ?? null),
+        onRetreatAlert: (info) => this._handleCombatRetreatAlert(info),
+      });
+      if (combatRes.handled) {
+        this._followingPlayer = null;
+        this.activity = sanitizeMcText(combatRes.activity, 64) || "护卫警戒";
+        if (combatRes.inCombat) {
+          this._scheduleCombatMicroTick(combatRes.cooldownMs);
+        } else {
+          this._clearCombatMicroTimer();
+        }
+        return { handled: true };
+      }
+      this._clearCombatMicroTimer();
+      return { handled: false, allowed };
+    }
+
+    this._clearCombatMicroTimer();
+    const creeper = findNearestCreeper(bot, CREEPER_SAFE_DISTANCE);
+    if (creeper) {
+      lowerShield(bot, this._combatState);
+      const rawDest = computeRetreatTarget(
+        origin,
+        creeper.entity.position,
+        10,
+        allowed?.player?.entity?.position ?? null,
+      );
+      let destX = rawDest.x;
+      let destZ = rawDest.z;
+      const creeperCol = this._checkColumnDryness(bot, destX, destZ, origin.y ?? 64);
+      if (!creeperCol.dry) {
+        const dryAlt = this._computeFleeTarget(
+          origin,
+          {
+            threats: [creeper],
+            nearest: creeper,
+            hasRanged: false,
+            centroid: { x: creeper.entity.position.x ?? 0, z: creeper.entity.position.z ?? 0 },
+          },
+          allowed,
+          0,
+          bot,
+        );
+        destX = dryAlt.tx;
+        destZ = dryAlt.tz;
+      }
+      applyNoDigMovements(bot);
+      try {
+        bot.setSprinting?.(true);
+        bot.pathfinder?.setGoal?.(new GoalNearXZ(destX, destZ, 2), true);
+      } catch {
+        // Ignore pathfinder errors
+      }
+      const creeperCurPos = this._vecToTuple(origin) || [origin.x ?? 0, origin.y ?? 64, origin.z ?? 0];
+      this._evadePlan = {
+        tx: destX,
+        tz: destZ,
+        setAtMs: nowMs,
+        lastPos: creeperCurPos,
+        angleIdx: 0,
+        creeper: true,
+      };
+      this._followingPlayer = null;
+      this.activity = "远离苦力怕";
+      this._handleCreeperAlert(creeper, allowed?.player ?? null);
+      return { handled: true };
+    }
+
+    const threatInfo = this._findEvadeThreats(bot, nowMs);
+    if (threatInfo) {
+      const shieldRes = updateEvadeShieldDefense({
+        bot,
+        combatState: this._combatState,
+        threats: threatInfo.threats,
+        nowMs,
+        eating: this._eatingLock.eating,
+        lookAtEntityFn: (b, e) => this._lookAtEntity(b, e),
+      });
+      const fleeAngles = [0, 60, -60, 120, -120];
+      const curPos = this._vecToTuple(origin) || [origin.x ?? 0, origin.y ?? 64, origin.z ?? 0];
+      let plan = this._evadePlan;
+      let needNewGoal = !plan;
+      let nextAngleIdx = plan ? plan.angleIdx : 0;
+      if (plan) {
+        const elapsedMs = nowMs - plan.setAtMs;
+        const distToGoal = Math.hypot(curPos[0] - plan.tx, curPos[2] - plan.tz);
+        const movedSincePlan = Math.hypot(
+          curPos[0] - plan.lastPos[0],
+          curPos[1] - plan.lastPos[1],
+          curPos[2] - plan.lastPos[2],
+        );
+        const threatAhead =
+          threatInfo.nearest.dist <= 5 &&
+          (threatInfo.nearest.entity.position.x - curPos[0]) * (plan.tx - curPos[0]) +
+            (threatInfo.nearest.entity.position.z - curPos[2]) * (plan.tz - curPos[2]) >
+            0;
+        if (elapsedMs >= 2_500 && movedSincePlan < 0.5 && !shieldRes.raised) {
+          // Flee path appears blocked by terrain/trees; rotate angle and nudge jump.
+          nextAngleIdx = (plan.angleIdx + 1) % fleeAngles.length;
+          needNewGoal = true;
+          try {
+            bot.setControlState?.("jump", true);
+            setTimeout(() => {
+              try {
+                bot.setControlState?.("jump", false);
+              } catch {
+                // Ignore
+              }
+            }, 220);
+          } catch {
+            // Ignore
+          }
+        } else if (distToGoal <= 3 || threatAhead || elapsedMs >= 4_500) {
+          nextAngleIdx = threatAhead ? (plan.angleIdx + 1) % fleeAngles.length : 0;
+          needNewGoal = true;
+        }
+      }
+      if (needNewGoal) {
+        const angleDeg = fleeAngles[nextAngleIdx] ?? 0;
+        const { tx, tz } = this._computeFleeTarget(origin, threatInfo, allowed, angleDeg, bot);
+        applyNoDigMovements(bot);
+        try {
+          if (!shieldRes.raised) {
+            bot.setSprinting?.(true);
+          }
+          bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
+        } catch {
+          // Ignore pathfinder errors
+        }
+        this._evadePlan = {
+          tx,
+          tz,
+          setAtMs: nowMs,
+          lastPos: curPos,
+          angleIdx: nextAngleIdx,
+        };
+      } else if (!shieldRes.raised) {
+        try {
+          bot.setSprinting?.(true);
+        } catch {
+          // Ignore sprint errors
+        }
+      }
+      this._followingPlayer = null;
+      this.activity = shieldRes.raised ? "举盾躲避" : "躲避怪物";
+      if (allowed && nowMs - this._lastHostileAlertAtMs >= this.hostileAlertCooldownMs) {
+        if (this._tryCompanionChat("呀！旁边有怪物靠近我，快救救猫猫喵~")) {
+          this._lastHostileAlertAtMs = nowMs;
+        }
+      }
+      return { handled: true };
+    }
+
+    const hadDefense = Boolean(this._evadePlan || this._combatState.shieldRaised);
+    lowerShield(bot, this._combatState);
+    this._combatState.shieldWindowStartMs = -Infinity;
+    this._evadePlan = null;
+    if (
+      hadDefense &&
+      !this.paused &&
+      (this.activity === "远离苦力怕" || this.activity === "躲避怪物" || this.activity === "举盾躲避")
+    ) {
+      this.activity = "原地待命";
+    }
+    return { handled: false, allowed };
   }
 
   _findGuardedPlayer(bot) {
@@ -1292,7 +1909,6 @@ export class McRuntime {
       !bot ||
       this.paused ||
       this._stopped ||
-      this._activeGoalCancel ||
       this._companionTickRunning
     ) {
       return;
@@ -1308,153 +1924,29 @@ export class McRuntime {
       const nextFood = readNonNegativeFinite(bot.food);
       if (nextFood !== null) this.food = nextFood;
 
-      if (this._shelterState.active) {
-        this.activity = "掩体避险";
-        return;
+      // While a bounded goal is running, check for immediate critical threats instead of
+      // staying blind for up to 35s; cancel interruptible goals and immediately defend/evade.
+      if (this._activeGoalCancel) {
+        if (!this._activeGoalMeta?.interruptable) {
+          return;
+        }
+        const interrupted = this._checkActiveGoalThreatInterrupt(bot, nowMs, { runDefense: false });
+        if (!interrupted) {
+          return;
+        }
       }
-
-      const allowed =
-        this.combatMode === "guard"
-          ? this._findGuardedPlayer(bot)
-          : this._findNearestAllowedPlayer(bot);
 
       // 1. Combat / Self-preservation layer
-      if (this.combatMode === "guard") {
-        const combatRes = await runGuardCombatStep({
-          bot,
-          combatState: this._combatState,
-          guardedPlayer: allowed?.player ?? null,
-          health: this.health,
-          food: this.food,
-          nowMs,
-          autoEquip: this.config.mcAutoEquip !== false,
-          eating: this._eatingLock.eating,
-          lookAtEntityFn: (b, e) => this._lookAtEntity(b, e),
-          onNeedHealEat: () => this._triggerUrgentEat(),
-          onCreeperAlert: (creeper) => this._handleCreeperAlert(creeper, allowed?.player ?? null),
-          onRetreatAlert: (info) => this._handleCombatRetreatAlert(info),
-        });
-        if (combatRes.handled) {
-          this._followingPlayer = null;
-          this.activity = sanitizeMcText(combatRes.activity, 64) || "护卫警戒";
-          if (combatRes.inCombat) {
-            this._scheduleCombatMicroTick(combatRes.cooldownMs);
-          } else {
-            this._clearCombatMicroTimer();
-          }
-          return;
-        }
-        this._clearCombatMicroTimer();
-      } else {
-        this._clearCombatMicroTimer();
-        const creeper = findNearestCreeper(bot, CREEPER_SAFE_DISTANCE);
-        if (creeper) {
-          lowerShield(bot, this._combatState);
-          const dest = computeRetreatTarget(
-            origin,
-            creeper.entity.position,
-            10,
-            allowed?.player?.entity?.position ?? null,
-          );
-          applyNoDigMovements(bot);
-          try {
-            bot.pathfinder?.setGoal?.(new GoalNearXZ(dest.x, dest.z, 2), true);
-          } catch {
-            // Ignore pathfinder errors
-          }
-          this._followingPlayer = null;
-          this.activity = "远离苦力怕";
-          this._handleCreeperAlert(creeper, allowed?.player ?? null);
-          return;
-        }
-        const threatInfo = this._findEvadeThreats(bot);
-        if (threatInfo) {
-          const shieldRes = updateEvadeShieldDefense({
-            bot,
-            combatState: this._combatState,
-            threats: threatInfo.threats,
-            nowMs,
-            eating: this._eatingLock.eating,
-            lookAtEntityFn: (b, e) => this._lookAtEntity(b, e),
-          });
-          const fleeAngles = [0, 60, -60, 120, -120];
-          const curPos = this._vecToTuple(origin) || [origin.x ?? 0, origin.y ?? 64, origin.z ?? 0];
-          let plan = this._evadePlan;
-          let needNewGoal = !plan;
-          let nextAngleIdx = plan ? plan.angleIdx : 0;
-          if (plan) {
-            const elapsedMs = nowMs - plan.setAtMs;
-            const distToGoal = Math.hypot(curPos[0] - plan.tx, curPos[2] - plan.tz);
-            const movedSincePlan = Math.hypot(
-              curPos[0] - plan.lastPos[0],
-              curPos[1] - plan.lastPos[1],
-              curPos[2] - plan.lastPos[2],
-            );
-            const threatAhead =
-              threatInfo.nearest.dist <= 5 &&
-              (threatInfo.nearest.entity.position.x - curPos[0]) * (plan.tx - curPos[0]) +
-                (threatInfo.nearest.entity.position.z - curPos[2]) * (plan.tz - curPos[2]) >
-                0;
-            if (elapsedMs >= 2_500 && movedSincePlan < 0.5 && !shieldRes.raised) {
-              // Flee path appears blocked by terrain/trees; rotate angle and nudge jump.
-              nextAngleIdx = (plan.angleIdx + 1) % fleeAngles.length;
-              needNewGoal = true;
-              try {
-                bot.setControlState?.("jump", true);
-                setTimeout(() => {
-                  try {
-                    bot.setControlState?.("jump", false);
-                  } catch {
-                    // Ignore
-                  }
-                }, 220);
-              } catch {
-                // Ignore
-              }
-            } else if (distToGoal <= 3 || threatAhead || elapsedMs >= 4_500) {
-              nextAngleIdx = threatAhead ? (plan.angleIdx + 1) % fleeAngles.length : 0;
-              needNewGoal = true;
-            }
-          }
-          if (needNewGoal) {
-            const angleDeg = fleeAngles[nextAngleIdx] ?? 0;
-            const { tx, tz } = this._computeFleeTarget(origin, threatInfo, allowed, angleDeg);
-            applyNoDigMovements(bot);
-            try {
-              if (!shieldRes.raised) {
-                bot.setSprinting?.(true);
-              }
-              bot.pathfinder?.setGoal?.(new GoalNearXZ(tx, tz, 2), true);
-            } catch {
-              // Ignore pathfinder errors
-            }
-            this._evadePlan = {
-              tx,
-              tz,
-              setAtMs: nowMs,
-              lastPos: curPos,
-              angleIdx: nextAngleIdx,
-            };
-          } else if (!shieldRes.raised) {
-            try {
-              bot.setSprinting?.(true);
-            } catch {
-              // Ignore sprint errors
-            }
-          }
-          this._followingPlayer = null;
-          this.activity = shieldRes.raised ? "举盾躲避" : "躲避怪物";
-          if (allowed && nowMs - this._lastHostileAlertAtMs >= this.hostileAlertCooldownMs) {
-            if (this._tryCompanionChat("呀！旁边有怪物靠近我，快救救猫猫喵~")) {
-              this._lastHostileAlertAtMs = nowMs;
-            }
-          }
-          return;
-        }
-        lowerShield(bot, this._combatState);
-        this._combatState.shieldWindowStartMs = -Infinity;
-        this._evadePlan = null;
+      const defenseRes = await this._runSurvivalDefenseStep(bot, nowMs);
+      if (defenseRes.handled) {
+        return;
       }
+      const allowed =
+        defenseRes.allowed !== undefined
+          ? defenseRes.allowed
+          : this.combatMode === "guard"
+            ? this._findGuardedPlayer(bot)
+            : this._findNearestAllowedPlayer(bot);
 
       // 2. Accompany nearest / guarded whitelisted player (look + continuous follow)
       if (allowed) {
@@ -1499,23 +1991,40 @@ export class McRuntime {
         return;
       }
 
-      // 3. Gentle solo stroll when alone (only when MC_COMPANION_MODE is enabled)
+      // 3. Gentle solo stroll when alone (only when MC_COMPANION_MODE is enabled; never pick water targets)
       if (
         this.config.mcCompanionMode &&
         !this._stayPut &&
         nowMs - this._lastSoloWanderAtMs >= this.soloWanderIntervalMs
       ) {
         this._lastSoloWanderAtMs = nowMs;
-        const dx = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
-        const dz = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
-        const wx = Math.round((origin.x ?? 0) + dx);
-        const wz = Math.round((origin.z ?? 0) + dz);
-        this._ensurePathfinder(bot);
-        try {
-          bot.pathfinder?.setGoal?.(new GoalNearXZ(wx, wz, 2), false);
-          this.activity = "四周闲逛";
-        } catch {
-          // Ignore wander errors
+        let chosen = null;
+        if (this._isBotInWater(bot)) {
+          const dryShore = this._findNearestDryLand(bot, 27);
+          if (dryShore) {
+            chosen = { wx: dryShore.x, wz: dryShore.z };
+          }
+        } else {
+          for (let i = 0; i < 8; i += 1) {
+            const dx = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
+            const dz = (Math.random() < 0.5 ? -1 : 1) * (6 + Math.floor(Math.random() * 6));
+            const wx = Math.round((origin.x ?? 0) + dx);
+            const wz = Math.round((origin.z ?? 0) + dz);
+            const col = this._checkColumnDryness(bot, wx, wz, origin.y ?? 64);
+            if (col.dry && !col.liquid) {
+              chosen = { wx, wz };
+              break;
+            }
+          }
+        }
+        if (chosen) {
+          this._ensurePathfinder(bot);
+          try {
+            bot.pathfinder?.setGoal?.(new GoalNearXZ(chosen.wx, chosen.wz, 2), false);
+            this.activity = "四周闲逛";
+          } catch {
+            // Ignore wander errors
+          }
         }
       }
     } catch {
@@ -1786,6 +2295,7 @@ export class McRuntime {
   }
 
   _cancelActiveGoal() {
+    this._activeGoalMeta = null;
     if (this._activeGoalCancel) {
       const fn = this._activeGoalCancel;
       this._activeGoalCancel = null;
@@ -1858,6 +2368,10 @@ export class McRuntime {
       this.freeSlots = invSnap.free_slots;
       this.safeFoodCount = bot.inventory ? countSafeFood(bot) : null;
       this.inWater = this._isBotInWater(bot);
+      this.inShelter = Boolean(this._shelterState.active);
+      const sky = this._computeSkyTelemetry(bot);
+      this.skyExposed = sky.skyExposed;
+      this.skyLight = sky.skyLight;
       this.timeOfDay = this._computeTimeOfDay(bot);
       this.nearbyResources = this._collectNearbyResources(bot, 16);
       this.nearbyEntities = this._collectNearbyEntities(bot);
@@ -1883,6 +2397,10 @@ export class McRuntime {
       if (nowMs - this._waterFloatState.lastCheckMs < 250) return;
       this._waterFloatState.lastCheckMs = nowMs;
       updateWaterFloatControl(bot, this._waterFloatState);
+      observeEndermanBehavior(bot, this._combatState, { nowMs });
+      if (this._activeGoalMeta?.interruptable) {
+        this._checkActiveGoalThreatInterrupt(bot, nowMs);
+      }
     });
 
     bot.on("respawn", () => {
@@ -1903,6 +2421,8 @@ export class McRuntime {
       this.food = readNonNegativeFinite(bot.food);
       this._prevHealth = this.health;
       this._combatState.retreating = false;
+      this._combatState.aggroEndermen?.clear?.();
+      this._combatState.endermanTracker?.clear?.();
       lowerShield(bot, this._combatState);
       const invSnap = collectInventorySnapshot(bot);
       this.equipment = invSnap.equipment;
@@ -1910,6 +2430,10 @@ export class McRuntime {
       this.freeSlots = invSnap.free_slots;
       this.safeFoodCount = bot.inventory ? countSafeFood(bot) : null;
       this.inWater = this._isBotInWater(bot);
+      this.inShelter = false;
+      const sky = this._computeSkyTelemetry(bot);
+      this.skyExposed = sky.skyExposed;
+      this.skyLight = sky.skyLight;
       this.timeOfDay = this._computeTimeOfDay(bot);
       this.nearbyResources = this._collectNearbyResources(bot, 16);
       this.nearbyEntities = this._collectNearbyEntities(bot);
@@ -1926,7 +2450,10 @@ export class McRuntime {
       const newHealth = readNonNegativeFinite(bot.health);
       const prev = this._prevHealth;
       if (newHealth !== null && prev !== null && newHealth < prev) {
-        this._combatState.lastDamageAtMs = this.nowFn();
+        this._handleDamageInterrupt(bot, {
+          damage: prev - newHealth,
+          newHealth,
+        });
       }
       this._refreshFromBot();
       if (
@@ -1946,6 +2473,25 @@ export class McRuntime {
       this._prevHealth = newHealth;
     });
 
+    bot.on("entityHurt", (entity) => {
+      if (this.bot !== bot || !this.connected) return;
+      if (entity && entity === bot.entity) {
+        this._handleDamageInterrupt(bot, {
+          newHealth: readNonNegativeFinite(bot.health),
+          fromHurtEvent: true,
+        });
+      }
+    });
+
+    bot.on("hurt", (attacker) => {
+      if (this.bot !== bot || !this.connected) return;
+      this._handleDamageInterrupt(bot, {
+        newHealth: readNonNegativeFinite(bot.health),
+        attacker: attacker && typeof attacker === "object" ? attacker : null,
+        fromHurtEvent: true,
+      });
+    });
+
     bot.on("death", () => {
       if (this.bot !== bot) return;
       this._cancelActiveGoal();
@@ -1954,12 +2500,15 @@ export class McRuntime {
       this._combatState.retreating = false;
       this._combatState.activeTargetId = null;
       this._combatState.shieldWindowStartMs = -Infinity;
+      this._combatState.aggroEndermen?.clear?.();
+      this._combatState.endermanTracker?.clear?.();
       this._evadePlan = null;
       this._waterFloatState.floating = false;
       this._shelterState.active = false;
       this._shelterState.capPos = null;
       this._shelterState.holePos = null;
       this._shelterState.surfaceY = null;
+      this.inShelter = false;
       this._unreachableBlocks.clear();
       this._autoTorchState = createAutoTorchState();
       this._hazardState = createHazardState();
@@ -2070,6 +2619,9 @@ export class McRuntime {
     this.freeSlots = null;
     this.safeFoodCount = null;
     this.inWater = false;
+    this.inShelter = false;
+    this.skyExposed = null;
+    this.skyLight = null;
     this.guardTarget = "";
     this.timeOfDay = "";
     this.nearbyResources = [];
@@ -2114,6 +2666,9 @@ export class McRuntime {
     this.freeSlots = null;
     this.safeFoodCount = null;
     this.inWater = false;
+    this.inShelter = false;
+    this.skyExposed = null;
+    this.skyLight = null;
     this.guardTarget = "";
     this.timeOfDay = "";
     this.nearbyResources = [];
@@ -2156,6 +2711,52 @@ export class McRuntime {
     }
   }
 
+  _restoreActivityAfterGoal(outcome) {
+    if (this.paused) {
+      this.activity = "已暂停";
+      return;
+    }
+    if (!this.connected) {
+      this.activity = "待机";
+      return;
+    }
+    if (outcome?.interrupted && this._isDefenseActivityActive()) {
+      return;
+    }
+    this.activity = this._shelterState.active ? "掩体避险" : "原地待命";
+  }
+
+  _buildInterruptedGoalResponse(outcome, actionLabel, extraFields = {}) {
+    const reason = outcome?.interruptReason || outcome?.reason || "interrupted_by_threat";
+    const mob = outcome?.threatMob || outcome?.threat_mob || "";
+    const summary =
+      reason === "interrupted_by_damage"
+        ? mob
+          ? `${actionLabel}因受到${mob}伤害中断，已切入躲避/防卫`
+          : `${actionLabel}因受伤中断，已切入躲避/防卫`
+        : reason === "interrupted_by_hazard"
+          ? `${actionLabel}因环境危险中断，已停止作业`
+          : reason === "interrupted_by_low_health"
+            ? mob
+              ? `${actionLabel}因残血遇险(${mob})中断，已切入躲避/回血`
+              : `${actionLabel}因残血遇险中断，已切入躲避/回血`
+            : mob
+              ? `${actionLabel}因附近威胁(${mob})中断，已切入躲避/防卫`
+              : `${actionLabel}因敌对威胁中断，已切入躲避/防卫`;
+    return {
+      ok: false,
+      accepted: true,
+      bridge_ready: true,
+      paused: false,
+      interrupted: true,
+      reason,
+      ...(mob ? { threat_mob: mob } : {}),
+      ...extraFields,
+      summary,
+      snapshot: this.getSnapshot(),
+    };
+  }
+
   async _runBoundedGoal(actionType, timeoutMs, fn) {
     this._cancelActiveGoal();
     this._stopBackgroundMotion(this.bot, { clearFollowing: actionType !== "follow" });
@@ -2163,10 +2764,23 @@ export class McRuntime {
     const controller = new AbortController();
     let timer = null;
     let timedOut = false;
+    let interruptInfo = null;
+    let resolveAbort = null;
 
     const cancel = () => {
+      if (this._activeGoalCancel === cancel) {
+        this._activeGoalCancel = null;
+      }
+      if (this._activeGoalMeta?.cancel === cancel) {
+        this._activeGoalMeta = null;
+      }
       if (!controller.signal.aborted) {
-        controller.abort();
+        controller.abort(interruptInfo?.reason || "mc_goal_cancelled");
+      }
+      try {
+        this.bot?.stopDigging?.();
+      } catch {
+        // Ignore stopDigging errors
       }
       try {
         this.bot?.pathfinder?.stop?.();
@@ -2175,26 +2789,83 @@ export class McRuntime {
         // Ignore pathfinder stop errors
       }
       clearBotControlStates(this.bot);
+      if (resolveAbort) {
+        const cb = resolveAbort;
+        resolveAbort = null;
+        cb();
+      }
     };
+
+    const meta = {
+      actionType,
+      cancel,
+      interruptable: SURVIVAL_INTERRUPTIBLE_GOALS.has(actionType),
+      interrupt: (reason, details = {}) => {
+        if (interruptInfo || timedOut || controller.signal.aborted) return false;
+        interruptInfo = {
+          reason: reason || "interrupted_by_threat",
+          threatMob: sanitizeMcText(details?.threatMob || "", 32),
+        };
+        cancel();
+        return true;
+      },
+    };
+
     this.activeTask = actionType;
     this._activeGoalCancel = cancel;
+    this._activeGoalMeta = meta;
     this._emitSnapshot();
 
+    const abortPromise = new Promise((resolve) => {
+      resolveAbort = () => {
+        if (timedOut) {
+          resolve({ timedOut: true });
+        } else if (interruptInfo) {
+          resolve({
+            aborted: true,
+            interrupted: true,
+            interruptReason: interruptInfo.reason,
+            threatMob: interruptInfo.threatMob,
+          });
+        } else {
+          resolve({ aborted: true });
+        }
+      };
+    });
+
     try {
-      const timeoutPromise = new Promise((_, reject) => {
+      const fnPromise = Promise.resolve().then(() => fn(controller.signal));
+      fnPromise.catch(() => {});
+      const timeoutPromise = new Promise((resolve) => {
         timer = setTimeout(() => {
           timedOut = true;
           cancel();
-          reject(new Error("mc_action_timeout"));
+          resolve({ timedOut: true });
         }, boundedMs);
       });
-      const res = await Promise.race([fn(controller.signal), timeoutPromise]);
+      const res = await Promise.race([fnPromise, timeoutPromise, abortPromise]);
       if (timedOut) return { timedOut: true };
+      if (interruptInfo) {
+        return {
+          aborted: true,
+          interrupted: true,
+          interruptReason: interruptInfo.reason,
+          threatMob: interruptInfo.threatMob,
+        };
+      }
       if (controller.signal.aborted) return { aborted: true };
       return res;
     } catch (err) {
       if (timedOut) {
         return { timedOut: true };
+      }
+      if (interruptInfo) {
+        return {
+          aborted: true,
+          interrupted: true,
+          interruptReason: interruptInfo.reason,
+          threatMob: interruptInfo.threatMob,
+        };
       }
       if (controller.signal.aborted) {
         return { aborted: true };
@@ -2202,9 +2873,16 @@ export class McRuntime {
       throw err;
     } finally {
       if (timer) clearTimeout(timer);
+      resolveAbort = null;
       this._lastActivityOrHumanAtMs = this.nowFn();
+      const cleared = this._activeGoalCancel === cancel || this._activeGoalMeta === meta;
       if (this._activeGoalCancel === cancel) {
         this._activeGoalCancel = null;
+      }
+      if (this._activeGoalMeta === meta) {
+        this._activeGoalMeta = null;
+      }
+      if (cleared) {
         this._emitSnapshot();
       }
     }
@@ -3392,8 +4070,15 @@ export class McRuntime {
           snapshot: this.getSnapshot(),
         };
       }
+      if (outcome?.interrupted) {
+        this._restoreActivityAfterGoal(outcome);
+        if (this.connected) this._emitSnapshot();
+        return this._buildInterruptedGoalResponse(outcome, "寻路", {
+          moved_blocks: movedBlocksGoto,
+        });
+      }
       if (outcome?.stuck || outcome?.timedOut || outcome?.aborted) {
-        this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+        this._restoreActivityAfterGoal(outcome);
         if (this.connected) this._emitSnapshot();
         return {
           ok: false,
@@ -3426,6 +4111,7 @@ export class McRuntime {
 
     if (actionType === "explore") {
       const startPos = this._vecToTuple(bot.entity?.position) || this.pos || [0, 64, 0];
+      const startedInWater = this._isBotInWater(bot);
       const baseAngle = Math.random() * Math.PI * 2;
       const radii = [
         15 + Math.floor(Math.random() * 8),
@@ -3434,14 +4120,43 @@ export class McRuntime {
       ];
       const angleOffsets = [0, (2 * Math.PI) / 3, -(2 * Math.PI) / 3];
       const candidates = [];
-      if (this._isBotInWater(bot)) {
-        const dryLand = this._findNearestDryLand(bot, 20);
-        if (dryLand) {
-          candidates.push({ tx: dryLand.x, tz: dryLand.z, label: "上岸探索" });
+      if (startedInWater) {
+        const dryShores = this._findDryLandCandidates(bot, 27, 3);
+        for (const shore of dryShores) {
+          candidates.push({ tx: shore.x, tz: shore.z, label: "上岸探索" });
         }
       }
+      const fallbackDirectional = [];
       for (let i = 0; i < angleOffsets.length; i += 1) {
-        candidates.push({ angle: baseAngle + angleOffsets[i], r: radii[i], label: "探索" });
+        const baseA = baseAngle + angleOffsets[i];
+        const baseR = radii[i];
+        let pickedDry = null;
+        if (typeof bot.blockAt === "function") {
+          const degShifts = [0, 25, -25, 50, -50, 90, -90];
+          const rProbes = [baseR, Math.max(6, baseR - 4), baseR + 4];
+          outerDir: for (const rp of rProbes) {
+            for (const deg of degShifts) {
+              const a = baseA + (deg * Math.PI) / 180;
+              const cx = Math.round(startPos[0] + Math.cos(a) * rp);
+              const cz = Math.round(startPos[2] + Math.sin(a) * rp);
+              const col = this._checkColumnDryness(bot, cx, cz, startPos[1]);
+              if (col.dry && !col.liquid) {
+                pickedDry = { tx: cx, tz: cz, label: "探索" };
+                break outerDir;
+              }
+            }
+          }
+        } else {
+          pickedDry = { angle: baseA, r: baseR, label: "探索" };
+        }
+        if (pickedDry) {
+          candidates.push(pickedDry);
+        } else {
+          fallbackDirectional.push({ angle: baseA, r: baseR, label: "探索" });
+        }
+      }
+      if (candidates.length === 0) {
+        candidates.push(...fallbackDirectional);
       }
       const surfaceEsc = this._findNearbySurfaceEscape(bot, 8);
       if (surfaceEsc) {
@@ -3495,7 +4210,8 @@ export class McRuntime {
             const endNow = this._vecToTuple(bot.entity?.position) || curNow;
             const movedTotal = computeExploreProgress(startPos, endNow);
             lastMoved = Math.max(lastMoved, movedTotal);
-            if (movedTotal >= 2.5) {
+            const stillInWater = this._isBotInWater(bot);
+            if (!stillInWater && (movedTotal >= 2.5 || (startedInWater && movedTotal >= 1.5))) {
               targetX = Math.round(endNow[0]);
               targetZ = Math.round(endNow[2]);
               return { ok: true, movedBlocks: Math.round(movedTotal) };
@@ -3509,7 +4225,8 @@ export class McRuntime {
             const endNow = this._vecToTuple(bot.entity?.position) || curNow;
             const movedTotal = computeExploreProgress(startPos, endNow);
             lastMoved = Math.max(lastMoved, movedTotal);
-            if (movedTotal >= 2.5) {
+            const stillInWater = this._isBotInWater(bot);
+            if (!stillInWater && (movedTotal >= 2.5 || (startedInWater && movedTotal >= 1.5))) {
               targetX = Math.round(endNow[0]);
               targetZ = Math.round(endNow[2]);
               return { ok: true, partial: true, movedBlocks: Math.round(movedTotal) };
@@ -3523,6 +4240,9 @@ export class McRuntime {
             }
           }
         }
+        if (this._isBotInWater(bot)) {
+          return { stillInWater: true, movedBlocks: Math.round(lastMoved) };
+        }
         return sawStuck
           ? { stuck: true, movedBlocks: Math.round(lastMoved) }
           : { noProgress: true, movedBlocks: Math.round(lastMoved) };
@@ -3530,7 +4250,7 @@ export class McRuntime {
       this._refreshFromBot();
       const rare = this.connected ? this._scanRareBlocks(bot, 24) : [];
       const signs = this.connected ? this._scanSigns(bot, 24) : [];
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
       const endPosExp = this._vecToTuple(bot.entity?.position) || this.pos || startPos;
       const actualMovedExp = computeExploreProgress(startPos, endPosExp);
@@ -3538,7 +4258,13 @@ export class McRuntime {
         typeof outcome?.movedBlocks === "number" ? outcome.movedBlocks : 0,
         Math.round(actualMovedExp),
       );
-      if (outcome?.timedOut && actualMovedExp >= 2.5) {
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "探索", {
+          moved_blocks: movedBlocks,
+        });
+      }
+      const endedInWater = this.connected && this._isBotInWater(bot);
+      if (outcome?.timedOut && actualMovedExp >= 2.5 && !endedInWater) {
         targetX = Math.round(endPosExp[0]);
         targetZ = Math.round(endPosExp[2]);
         const summary = `探索推进至(${targetX},${targetZ}) 移动${movedBlocks}格(时间上限) 发现稀有矿${rare.length}处 告示牌${signs.length}块`;
@@ -3555,6 +4281,18 @@ export class McRuntime {
           moved_blocks: movedBlocks,
           rare_blocks: rare,
           signs,
+          snapshot: this.getSnapshot(),
+        };
+      }
+      if ((outcome?.stillInWater || endedInWater) && !outcome?.aborted) {
+        return {
+          ok: false,
+          accepted: true,
+          bridge_ready: true,
+          paused: false,
+          reason: "still_in_water",
+          moved_blocks: movedBlocks,
+          summary: `探索后仍在水中(移动${movedBlocks}格)，尚未成功上岸`,
           snapshot: this.getSnapshot(),
         };
       }
@@ -3676,7 +4414,7 @@ export class McRuntime {
       });
 
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
       const outcomeCount = outcome?.collected_count ?? 0;
       const collectedCount = Math.max(outcomeCount, gatherProgress.collectedCount);
@@ -3688,6 +4426,14 @@ export class McRuntime {
         outcomeCount >= gatherProgress.collectedCount
           ? outcome?.pos || gatherProgress.lastCoords
           : gatherProgress.lastCoords;
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "采集", {
+          block: lastBlockName,
+          collected_count: collectedCount,
+          requested_count: requestedCount,
+          partial: collectedCount > 0,
+        });
+      }
       if (
         collectedCount === 0 &&
         outcome?.blockedTierInfo &&
@@ -3853,8 +4599,11 @@ export class McRuntime {
         }
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "跟随");
+      }
       if (outcome?.aborted && !outcome?.timedOut) {
         return {
           ok: false,
@@ -4031,11 +4780,20 @@ export class McRuntime {
           signal,
           isUnreachableFn: (pos) => this._unreachableBlocks.has(pos, this.nowFn()),
           markUnreachableFn: (pos) => this._unreachableBlocks.mark(pos, { nowMs: this.nowFn() }),
+          inShelter: Boolean(this._shelterState.active),
         });
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "合成", {
+          item_name: parsed.itemName,
+          requested_count: parsed.count,
+          crafted_count: 0,
+          missing_materials: [],
+        });
+      }
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -4086,6 +4844,9 @@ export class McRuntime {
         ...(typeof outcome?.wood_shortfall_logs === "number" && outcome.wood_shortfall_logs > 0
           ? { wood_shortfall_logs: outcome.wood_shortfall_logs }
           : {}),
+        ...(outcome?.reason === "sheltered_no_space" || this._shelterState.active
+          ? { in_shelter: true }
+          : {}),
         snapshot: this.getSnapshot(),
       };
     }
@@ -4126,8 +4887,17 @@ export class McRuntime {
         });
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "熔炼", {
+          item_name: parsed.itemName,
+          output_item: "",
+          requested_count: parsed.count,
+          smelted_count: 0,
+          missing_materials: [],
+        });
+      }
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -4226,11 +4996,38 @@ export class McRuntime {
           huntAttackCooldownMs: this.huntAttackCooldownMs,
           isUnreachableFn: (pos) => this._unreachableBlocks.has(pos, this.nowFn()),
           markUnreachableFn: (pos) => this._unreachableBlocks.mark(pos, { nowMs: this.nowFn() }),
+          inShelter: Boolean(this._shelterState.active),
+          combatState: this._combatState,
         });
       });
+      if (
+        outcome?.interrupted &&
+        !outcome?.interruptReason &&
+        (outcome?.reason === "interrupted_by_threat" ||
+          outcome?.reason === "interrupted_by_low_health")
+      ) {
+        await this._runImmediateSurvivalDefense(this.nowFn());
+      }
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "自动筹料", {
+          item_name: outcome?.item_name ?? parsed.itemName,
+          requested_count: outcome?.requested_count ?? parsed.count,
+          acquired_count: outcome?.acquired_count ?? 0,
+          owned_count: outcome?.owned_count ?? 0,
+          partial: Boolean(outcome?.partial),
+          steps_completed: Array.isArray(outcome?.steps_completed) ? outcome.steps_completed : [],
+          ...(outcome?.blocker_item ? { blocker_item: outcome.blocker_item } : {}),
+          ...(typeof outcome?.wood_shortfall_planks === "number" && outcome.wood_shortfall_planks > 0
+            ? { wood_shortfall_planks: outcome.wood_shortfall_planks }
+            : {}),
+          ...(typeof outcome?.wood_shortfall_logs === "number" && outcome.wood_shortfall_logs > 0
+            ? { wood_shortfall_logs: outcome.wood_shortfall_logs }
+            : {}),
+        });
+      }
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -4278,6 +5075,15 @@ export class McRuntime {
         partial: Boolean(outcome?.partial),
         steps_completed: Array.isArray(outcome?.steps_completed) ? outcome.steps_completed : [],
         ...(outcome?.blocker_item ? { blocker_item: outcome.blocker_item } : {}),
+        ...(typeof outcome?.wood_shortfall_planks === "number" && outcome.wood_shortfall_planks > 0
+          ? { wood_shortfall_planks: outcome.wood_shortfall_planks }
+          : {}),
+        ...(typeof outcome?.wood_shortfall_logs === "number" && outcome.wood_shortfall_logs > 0
+          ? { wood_shortfall_logs: outcome.wood_shortfall_logs }
+          : {}),
+        ...(outcome?.reason === "sheltered_no_space" || this._shelterState.active
+          ? { in_shelter: true }
+          : {}),
         snapshot: this.getSnapshot(),
       };
     }
@@ -4414,8 +5220,11 @@ export class McRuntime {
         });
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "狩猎");
+      }
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -4455,8 +5264,11 @@ export class McRuntime {
         });
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "睡觉");
+      }
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -4507,8 +5319,11 @@ export class McRuntime {
         });
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "箱子交互");
+      }
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -4549,8 +5364,11 @@ export class McRuntime {
         return await executePlaceAction(bot, params, { signal });
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "放置");
+      }
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,
@@ -4603,8 +5421,11 @@ export class McRuntime {
         });
       });
       this._refreshFromBot();
-      this.activity = this.paused ? "已暂停" : this.connected ? "原地待命" : "待机";
+      this._restoreActivityAfterGoal(outcome);
       if (this.connected) this._emitSnapshot();
+      if (outcome?.interrupted) {
+        return this._buildInterruptedGoalResponse(outcome, "递物");
+      }
       if (outcome?.timedOut || outcome?.aborted) {
         return {
           ok: false,

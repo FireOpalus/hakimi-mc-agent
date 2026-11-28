@@ -9,6 +9,7 @@ import {
   executeCraftAction,
   findNearbyCraftingTable,
   getPlanksForLog,
+  isCrampedEnclosedSpace,
   isPlanksName,
 } from "./crafting.mjs";
 import {
@@ -22,7 +23,12 @@ import {
   executeHuntAction,
   isBedName,
 } from "./world_actions.mjs";
-import { CREEPER_SAFE_DISTANCE, findNearestAnyHostile, findNearestCreeper } from "./combat.mjs";
+import {
+  CREEPER_SAFE_DISTANCE,
+  findCriticalGoalInterruptThreat,
+  findNearestAnyHostile,
+  findNearestCreeper,
+} from "./combat.mjs";
 
 export const MIN_ACQUIRE_COUNT = 1;
 export const MAX_ACQUIRE_COUNT = 16;
@@ -312,6 +318,10 @@ export async function executeAcquireAction(
     huntAttackCooldownMs = null,
     isUnreachableFn = null,
     markUnreachableFn = null,
+    inShelter = false,
+    combatState = null,
+    verifyCraftSync = null,
+    craftSyncTimeoutMs = 450,
   } = {},
 ) {
   const parsed = parseAcquireParams(params);
@@ -361,9 +371,12 @@ export async function executeAcquireAction(
     visiting: new Set(),
     blockerReason: "",
     blockerItem: "",
+    threatMob: "",
     woodShortfallLogs: 0,
     woodShortfallPlanks: 0,
   };
+
+  const isInCrampedShelter = () => isCrampedEnclosedSpace(bot, { inShelter });
 
   const checkInterrupt = () => {
     if (signal?.aborted) {
@@ -379,16 +392,31 @@ export async function executeAcquireAction(
     if (hazard.severity >= 2) {
       return { stopped: true, reason: "interrupted_by_hazard" };
     }
-    if (findNearestCreeper(bot, CREEPER_SAFE_DISTANCE)) {
-      return { stopped: true, reason: "interrupted_by_threat" };
+    if (!isInCrampedShelter() && findNearestCreeper(bot, CREEPER_SAFE_DISTANCE)) {
+      ctx.threatMob = "creeper";
+      return { stopped: true, reason: "interrupted_by_threat", threatMob: "creeper" };
     }
     if (
+      !isInCrampedShelter() &&
       combatMode === "evade" &&
       typeof bot.health === "number" &&
-      bot.health <= 7 &&
-      findNearestAnyHostile(bot, 12)
+      bot.health <= 7
     ) {
-      return { stopped: true, reason: "interrupted_by_low_health" };
+      const hostile = findNearestAnyHostile(bot, 12, combatState, nowFn());
+      if (hostile) {
+        ctx.threatMob = hostile.name || "";
+        return { stopped: true, reason: "interrupted_by_low_health", threatMob: hostile.name || "" };
+      }
+    }
+    if (!isInCrampedShelter()) {
+      const threat = findCriticalGoalInterruptThreat(bot, {
+        combatState,
+        nowMs: nowFn(),
+      });
+      if (threat) {
+        ctx.threatMob = threat.name || "";
+        return { stopped: true, reason: "interrupted_by_threat", threatMob: threat.name || "" };
+      }
     }
     return null;
   };
@@ -403,6 +431,11 @@ export async function executeAcquireAction(
   const runGather = async (blockNames, count, labelItem) => {
     const intr = checkInterrupt();
     if (intr) return { ok: false, reason: intr.reason, item: labelItem };
+    if (isInCrampedShelter()) {
+      const itemLabel = labelItem || blockNames[0] || "";
+      recordBlocker("sheltered_no_space", itemLabel);
+      return { ok: false, reason: "sheltered_no_space", item: itemLabel };
+    }
     if (typeof gatherBlocksFn !== "function") {
       return { ok: false, reason: "gather_unavailable", item: labelItem };
     }
@@ -446,6 +479,12 @@ export async function executeAcquireAction(
       return { ok: true };
     }
     const logsNeeded = Math.max(1, Math.min(6, Math.ceil(planksNeeded / 4)));
+    if (isInCrampedShelter()) {
+      ctx.woodShortfallPlanks = Math.max(ctx.woodShortfallPlanks, planksNeeded);
+      ctx.woodShortfallLogs = Math.max(ctx.woodShortfallLogs, Math.ceil(planksNeeded / 4));
+      recordBlocker("sheltered_no_space", "oak_log");
+      return { ok: false, reason: "sheltered_no_space", item: "oak_log" };
+    }
     let preferredLog = "";
     if (preferredSpeciesPlanks && preferredSpeciesPlanks.endsWith("_planks")) {
       preferredLog = `${preferredSpeciesPlanks.slice(0, -"_planks".length)}_log`;
@@ -678,6 +717,10 @@ export async function executeAcquireAction(
           if (curRaw < need) {
             const intrHunt = checkInterrupt();
             if (intrHunt) return { ok: false, reason: intrHunt.reason, item: smeltInput };
+            if (isInCrampedShelter()) {
+              recordBlocker("sheltered_no_space", spec.huntMob);
+              return { ok: false, reason: "sheltered_no_space", item: spec.huntMob };
+            }
             ctx.stepCount += 1;
             const huntRes = await executeHuntAction(
               bot,
@@ -753,6 +796,35 @@ export async function executeAcquireAction(
       if (isBedName(target)) {
         const color = target.slice(0, -"_bed".length);
         const woolName = `${color}_wool`;
+        const crampedShelterNow = isInCrampedShelter();
+        const reachableTableNow = findNearbyCraftingTable(
+          bot,
+          crampedShelterNow ? 3.5 : CRAFTING_TABLE_SEARCH_RADIUS,
+          { isUnreachableFn },
+        );
+        const needTable = !reachableTableNow && countOwnedItem(bot, "crafting_table") === 0;
+
+        if (crampedShelterNow) {
+          const curWood = computeWoodInventory(countInventoryByName(bot));
+          const planksGap = Math.max(
+            3 + (needTable ? 4 : 0) - curWood.totalPotentialPlanks,
+            3 - curWood.bestSpeciesPotential,
+            0,
+          );
+          if (planksGap > 0) {
+            ctx.woodShortfallPlanks = Math.max(ctx.woodShortfallPlanks, planksGap);
+            ctx.woodShortfallLogs = Math.max(ctx.woodShortfallLogs, Math.ceil(planksGap / 4));
+          }
+          if (countOwnedItem(bot, woolName) < 3) {
+            recordBlocker("sheltered_no_space", woolName);
+            return { ok: false, reason: "sheltered_no_space", item: woolName };
+          }
+          if (!reachableTableNow) {
+            recordBlocker("sheltered_no_space", "crafting_table");
+            return { ok: false, reason: "sheltered_no_space", item: "crafting_table" };
+          }
+        }
+
         if (countOwnedItem(bot, woolName) < 3) {
           const intrWool = checkInterrupt();
           if (intrWool) return { ok: false, reason: intrWool.reason, item: woolName };
@@ -776,9 +848,6 @@ export async function executeAcquireAction(
             return { ok: false, reason: "missing_materials", item: woolName };
           }
         }
-        const needTable =
-          !findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS, { isUnreachableFn }) &&
-          countOwnedItem(bot, "crafting_table") === 0;
         const woodRes = await ensureWoodPlanks(
           3 + (needTable ? 4 : 0),
           { sameSpeciesMin: 3 },
@@ -786,21 +855,56 @@ export async function executeAcquireAction(
         );
         if (!woodRes.ok) return woodRes;
 
-        ctx.stepCount += 1;
-        let craftBed;
-        try {
-          craftBed = await executeCraftAction(
-            bot,
-            { item_name: target, count: 1 },
-            { gotoFn, autoEquip: false, signal, isUnreachableFn, markUnreachableFn },
-          );
-        } catch {
-          craftBed = { ok: false, reason: "craft_failed" };
-        }
+        const attemptCraftBed = async () => {
+          ctx.stepCount += 1;
+          try {
+            return await executeCraftAction(
+              bot,
+              { item_name: target, count: 1 },
+              {
+                gotoFn,
+                autoEquip: false,
+                signal,
+                isUnreachableFn,
+                markUnreachableFn,
+                verifyCraftSync,
+                craftSyncTimeoutMs,
+                inShelter,
+              },
+            );
+          } catch {
+            return { ok: false, reason: "craft_failed" };
+          }
+        };
+
+        let craftBed = await attemptCraftBed();
         if (craftBed?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
+        if (
+          !craftBed?.ok &&
+          craftBed?.reason === "no_crafting_table" &&
+          (craftBed.wood_shortfall_logs ?? 0) === 0 &&
+          depth < ctx.maxDepth - 1 &&
+          !checkInterrupt()
+        ) {
+          const tableRes = await ensureItem("crafting_table", 1, depth + 1);
+          if (tableRes.ok && !checkInterrupt()) {
+            craftBed = await attemptCraftBed();
+            if (craftBed?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
+          } else if (tableRes?.reason && tableRes.reason !== "no_crafting_table") {
+            recordBlocker(tableRes.reason, tableRes.item || "crafting_table");
+            return { ok: false, reason: tableRes.reason, item: tableRes.item || "crafting_table" };
+          }
+        }
         if (craftBed?.ok) {
           ctx.steps.push(`craft:${target}x${craftBed.crafted_count}`);
           return { ok: true };
+        }
+        if ((craftBed?.wood_shortfall_logs ?? 0) > 0) {
+          ctx.woodShortfallLogs = Math.max(ctx.woodShortfallLogs, Number(craftBed.wood_shortfall_logs) || 0);
+          ctx.woodShortfallPlanks = Math.max(
+            ctx.woodShortfallPlanks,
+            Number(craftBed.wood_shortfall_planks) || 0,
+          );
         }
         recordBlocker(craftBed?.reason || "craft_failed", target);
         return { ok: false, reason: craftBed?.reason || "craft_failed", item: target };
@@ -846,9 +950,27 @@ export async function executeAcquireAction(
       const stickGap = Math.max(0, needSticks - haveSticks);
       const planksForSticks = stickGap > 0 ? Math.ceil(stickGap / 4) * 2 : 0;
       const recipePlanks = (recipe.planks ?? 0) * batches;
+      const crampedForRecipe = isInCrampedShelter();
+      const reachableTableForRecipe = recipe.needsTable
+        ? findNearbyCraftingTable(
+            bot,
+            crampedForRecipe ? 3.5 : CRAFTING_TABLE_SEARCH_RADIUS,
+            { isUnreachableFn },
+          )
+        : null;
+      if (recipe.needsTable && crampedForRecipe && !reachableTableForRecipe) {
+        const curWood = computeWoodInventory(countsBeforeWood);
+        const remPlanks = Math.max(0, recipePlanks + planksForSticks + 4 - curWood.totalPotentialPlanks);
+        if (remPlanks > 0) {
+          ctx.woodShortfallPlanks = Math.max(ctx.woodShortfallPlanks, remPlanks);
+          ctx.woodShortfallLogs = Math.max(ctx.woodShortfallLogs, Math.ceil(remPlanks / 4));
+        }
+        recordBlocker("sheltered_no_space", "crafting_table");
+        return { ok: false, reason: "sheltered_no_space", item: "crafting_table" };
+      }
       const needTableWood =
         Boolean(recipe.needsTable) &&
-        !findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS, { isUnreachableFn }) &&
+        !reachableTableForRecipe &&
         (countsBeforeWood.get("crafting_table") ?? 0) === 0
           ? 4
           : 0;
@@ -885,6 +1007,9 @@ export async function executeAcquireAction(
               signal,
               isUnreachableFn,
               markUnreachableFn,
+              verifyCraftSync,
+              craftSyncTimeoutMs,
+              inShelter,
             },
           );
         } catch {
@@ -919,6 +1044,26 @@ export async function executeAcquireAction(
             craftRes = await attemptCraft();
             if (craftRes?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
           }
+        }
+      }
+      // If a 3x3 craft still failed with no_crafting_table while wood_shortfall_logs == 0
+      // (materials already available, e.g. inline crafting_table 450ms sync miss),
+      // explicitly invoke ensureItem("crafting_table", 1) and retry before failing.
+      if (
+        !craftRes?.ok &&
+        craftRes?.reason === "no_crafting_table" &&
+        (craftRes.wood_shortfall_logs ?? 0) === 0 &&
+        target !== "crafting_table" &&
+        depth < ctx.maxDepth - 1 &&
+        !checkInterrupt()
+      ) {
+        const tableRes = await ensureItem("crafting_table", 1, depth + 1);
+        if (tableRes.ok && !checkInterrupt()) {
+          craftRes = await attemptCraft();
+          if (craftRes?.aborted) return { ok: false, reason: "mc_goal_cancelled", item: target };
+        } else if (tableRes?.reason && tableRes.reason !== "no_crafting_table") {
+          recordBlocker(tableRes.reason, tableRes.item || "crafting_table");
+          return { ok: false, reason: tableRes.reason, item: tableRes.item || "crafting_table" };
         }
       }
       if (craftRes?.ok) {
@@ -982,6 +1127,9 @@ export async function executeAcquireAction(
     partial: ctx.steps.length > 0 || acquiredCount > 0,
     steps_completed: ctx.steps.slice(0, 8),
     blocker_item: blockerItem,
+    ...(ctx.threatMob ? { threat_mob: ctx.threatMob } : {}),
+    ...(blockerReason.startsWith("interrupted_") ? { interrupted: true } : {}),
+    ...(blockerReason === "sheltered_no_space" ? { in_shelter: true } : {}),
     ...(ctx.woodShortfallLogs > 0
       ? {
           wood_shortfall_logs: ctx.woodShortfallLogs,

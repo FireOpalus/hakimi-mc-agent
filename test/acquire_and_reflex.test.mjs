@@ -1158,3 +1158,577 @@ test("v2.10.5 live-Paper fixes: bounded goals stop background evade pathfinder, 
   // Must NOT falsely return ok=true when coal=0; falls back toward charcoal/furnace
   assert.equal(coalRes.ok, false);
 });
+
+test("P0 active-goal threat & damage interrupts: cancels slow gather/explore cleanly, triggers immediate shield/evade, and never self-interrupts shelter", async () => {
+  // 1. Threat interrupt during slow hanging gather: trident drowned approaches -> cancels gather, stops dig/pathfinder, raises shield!
+  const treeBlocks = new Map([
+    ["3,64,0", { name: "oak_log", boundingBox: "block" }],
+    ["3,63,0", { name: "grass_block", boundingBox: "block" }],
+  ]);
+  const bot1 = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    offHandItem: { name: "shield", count: 1 },
+    blocks: treeBlocks,
+  });
+  let stopDiggingCalls = 0;
+  let stopPathfinderCalls = 0;
+  bot1.stopDigging = () => {
+    stopDiggingCalls += 1;
+  };
+  bot1.pathfinder.stop = () => {
+    stopPathfinderCalls += 1;
+  };
+  bot1.pathfinder.goto = async () => {
+    bot1.entity.position = vec3(2, 64, 0);
+  };
+  bot1.dig = async () => {
+    // Simulate slow digging that would hang 30s unless interrupted
+    await new Promise(() => {});
+  };
+  let fakeNow = 50_000;
+  const rt1 = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "true", MC_COMBAT_MODE: "evade" }),
+    createBotFn: () => bot1,
+    nowFn: () => fakeNow,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  rt1.connectBot();
+  bot1.emit("spawn");
+
+  const gatherPromise = rt1.dispatchGoal({
+    action_type: "gather",
+    block_type: "oak_log",
+    count: 1,
+    timeout_ms: 10_000,
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(rt1._activeGoalCancel !== null);
+
+  // Trident drowned spawns at 14m -> companionTick interrupts active gather immediately!
+  bot1.entities[88] = {
+    id: 88,
+    name: "drowned",
+    position: vec3(16, 64, 0),
+    heldItem: { name: "trident" },
+  };
+  await rt1._companionTick();
+
+  const gatherRes = await gatherPromise;
+  assert.equal(gatherRes.ok, false);
+  assert.equal(gatherRes.reason, "interrupted_by_threat");
+  assert.equal(gatherRes.interrupted, true);
+  assert.equal(gatherRes.threat_mob, "drowned");
+  assert.equal(rt1._activeGoalCancel, null);
+  assert.ok(stopDiggingCalls >= 1);
+  assert.ok(stopPathfinderCalls >= 1);
+  assert.equal(rt1._combatState.shieldRaised, true);
+  assert.equal(rt1.activity, "举盾躲避");
+  rt1.stop();
+
+  // 2. Damage interrupt during slow explore in solo mode (MC_COMPANION_MODE=false!) with unprovoked-metadata enderman!
+  const bot2 = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    health: 20,
+    entities: {
+      91: { id: 91, name: "enderman", position: vec3(4, 64, 0), metadata: [] },
+    },
+  });
+  const fleeGoals = [];
+  bot2.pathfinder.setGoal = (g) => {
+    if (g) fleeGoals.push(g);
+  };
+  bot2.pathfinder.goto = async () => {
+    await new Promise(() => {});
+  };
+  const rt2 = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "false", MC_COMBAT_MODE: "evade" }),
+    createBotFn: () => bot2,
+    nowFn: () => fakeNow,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  rt2.connectBot();
+  bot2.emit("spawn");
+
+  const expPromise = rt2.dispatchGoal({ action_type: "explore", timeout_ms: 10_000 });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(rt2._activeGoalCancel !== null);
+
+  // Bot takes 7 HP damage from enderman -> health event marks enderman aggro, cancels explore, and starts evade!
+  bot2.health = 13;
+  bot2.emit("health");
+
+  const expRes = await expPromise;
+  assert.equal(expRes.ok, false);
+  assert.equal(expRes.reason, "interrupted_by_damage");
+  assert.equal(expRes.interrupted, true);
+  assert.equal(expRes.threat_mob, "enderman");
+  assert.equal(rt2._activeGoalCancel, null);
+  assert.ok(fleeGoals.length >= 1, "expected immediate evade flee goal after damage interrupt");
+  assert.ok(rt2._evadePlan !== null);
+  assert.equal(rt2.activity, "躲避怪物");
+  assert.deepEqual(rt2.getSnapshot().nearby_entities, ["enderman"]);
+  rt2.stop();
+
+  // 3. shelter enter is NEVER self-interrupted even when a hostile is close or hits the bot
+  const shBlocks = new Map();
+  for (let dx = -1; dx <= 1; dx += 1) {
+    for (let dz = -1; dz <= 1; dz += 1) {
+      for (let y = 60; y <= 63; y += 1) {
+        shBlocks.set(`${dx},${y},${dz}`, { name: "dirt", boundingBox: "block" });
+      }
+      shBlocks.set(`${dx},64,${dz}`, { name: "air", boundingBox: "empty" });
+    }
+  }
+  const shBot = makeRichCraftBot({
+    pos: vec3(0.5, 64, 0.5),
+    initialItems: [{ name: "dirt", count: 8 }],
+    blocks: shBlocks,
+    entities: { 95: { id: 95, name: "creeper", position: vec3(4, 64, 0) } },
+  });
+  shBot.entity.onGround = true;
+  shBot.dig = async (blk) => {
+    shBlocks.set(`${blk.position.x},${blk.position.y},${blk.position.z}`, {
+      name: "air",
+      boundingBox: "empty",
+    });
+    shBot.entity.position = vec3(0.5, blk.position.y, 0.5);
+  };
+  shBot.placeBlock = async (ref, face) => {
+    shBlocks.set(
+      `${ref.position.x + face.x},${ref.position.y + face.y},${ref.position.z + face.z}`,
+      { name: "dirt", boundingBox: "block" },
+    );
+  };
+  const shRt = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "true" }),
+    createBotFn: () => shBot,
+    nowFn: () => fakeNow,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  shRt.connectBot();
+  shBot.emit("spawn");
+
+  const shPromise = shRt.dispatchGoal({ action_type: "shelter", mode: "enter" });
+  shBot.health = 16;
+  shBot.emit("health");
+  await shRt._companionTick();
+  const shRes = await shPromise;
+  assert.equal(shRes.ok, true);
+  assert.equal(shRes.sheltered, true);
+  assert.equal(shRt.getSnapshot().in_shelter, true);
+  assert.equal(shRt.getSnapshot().sky_exposed, false);
+  shRt.stop();
+});
+
+test("P0 water blackhole fixes: explore rejects still_in_water displacement, flee/wander avoid water targets", async () => {
+  // 1. Bot in wide ocean: moving >= 2.5m while STILL in water MUST return ok=false reason="still_in_water"
+  const oceanBot = makeRichCraftBot({ pos: vec3(0, 62.7, 0) });
+  oceanBot.entity.isInWater = true;
+  oceanBot.blockAt = (p) => {
+    const y = Math.floor(p.y);
+    if (y <= 62) return { name: "water", boundingBox: "empty", position: vec3(Math.floor(p.x), y, Math.floor(p.z)) };
+    return { name: "air", boundingBox: "empty", position: vec3(Math.floor(p.x), y, Math.floor(p.z)) };
+  };
+  oceanBot.pathfinder.goto = async () => {
+    // Swims 6 blocks horizontally but stays in water!
+    oceanBot.entity.position = vec3(6, 62.7, 0);
+  };
+  const oceanRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => oceanBot,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  oceanRt.connectBot();
+  oceanBot.emit("spawn");
+
+  const swimRes = await oceanRt.dispatchGoal({ action_type: "explore" });
+  assert.equal(swimRes.ok, false);
+  assert.equal(swimRes.reason, "still_in_water");
+  assert.equal(swimRes.moved_blocks, 6);
+
+  // Timeout while still in water after swimming 5m must ALSO return still_in_water (not ok=true)
+  oceanBot.entity.position = vec3(0, 62.7, 0);
+  oceanBot.pathfinder.goto = async () => {
+    setTimeout(() => {
+      oceanBot.entity.position = vec3(5, 62.7, 0);
+    }, 15);
+    await new Promise(() => {});
+  };
+  const swimTimeoutRes = await oceanRt.dispatchGoal({ action_type: "explore", timeout_ms: 120 });
+  assert.equal(swimTimeoutRes.ok, false);
+  assert.equal(swimTimeoutRes.reason, "still_in_water");
+  assert.equal(swimTimeoutRes.moved_blocks, 5);
+  oceanRt.stop();
+
+  // 2. _computeFleeTarget & soloWander avoid water zone and choose dry solid land instead
+  //    Direct flee away from threat at (+5,64,0) points to -X (x < -2 is all water; z != 0 is dry grass)
+  const fleeBot = makeRichCraftBot({ pos: vec3(0, 64, 0) });
+  fleeBot.blockAt = (p) => {
+    const x = Math.floor(p.x);
+    const y = Math.floor(p.y);
+    const z = Math.floor(p.z);
+    if (y === 63) {
+      if (x <= -3 && Math.abs(z) <= 10) {
+        return { name: "water", boundingBox: "empty", position: vec3(x, y, z) };
+      }
+      return { name: "grass_block", boundingBox: "block", position: vec3(x, y, z) };
+    }
+    if (y < 63) return { name: "stone", boundingBox: "block", position: vec3(x, y, z) };
+    return { name: "air", boundingBox: "empty", position: vec3(x, y, z) };
+  };
+  const wanderGoals = [];
+  fleeBot.pathfinder.setGoal = (g) => {
+    if (g) wanderGoals.push(g);
+  };
+  let fakeNow = 100_000;
+  const fleeRt = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "true" }),
+    createBotFn: () => fleeBot,
+    nowFn: () => fakeNow,
+    soloWanderIntervalMs: 1_000,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  fleeRt.connectBot();
+  fleeBot.emit("spawn");
+
+  const threatInfo = {
+    threats: [{ entity: { position: vec3(5, 64, 0) }, name: "zombie", dist: 5, isRanged: false }],
+    nearest: { entity: { position: vec3(5, 64, 0) }, name: "zombie", dist: 5, isRanged: false },
+    hasRanged: false,
+    centroid: { x: 5, z: 0 },
+  };
+  const fleeDest = fleeRt._computeFleeTarget(vec3(0, 64, 0), threatInfo, null, 0, fleeBot);
+  const destCol = fleeRt._checkColumnDryness(fleeBot, fleeDest.tx, fleeDest.tz, 64);
+  assert.equal(destCol.dry, true);
+  assert.equal(destCol.liquid, false);
+
+  // soloWander must never choose a water column
+  fakeNow += 10_000;
+  await fleeRt._companionTick();
+  assert.ok(wanderGoals.length >= 1);
+  const wg = wanderGoals[wanderGoals.length - 1];
+  const wgCol = fleeRt._checkColumnDryness(fleeBot, Math.round(wg.x), Math.round(wg.z), 64);
+  assert.equal(wgCol.dry, true);
+  assert.equal(wgCol.liquid, false);
+  fleeRt.stop();
+});
+
+test("P1 acquire furnace crafting_table fallback, cramped 1x1x2 shelter bed/3x3 guard, and sky telemetry", async () => {
+  // 1. acquire furnace: inline crafting_table craft misses sync (no_crafting_table with wood_shortfall_logs == 0)
+  //    -> falls back to explicit ensureItem("crafting_table", 1) and retries furnace craft -> succeeds!
+  const furnBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    initialItems: [
+      { name: "cobblestone", count: 8 },
+      { name: "oak_planks", count: 4 },
+    ],
+    blocks: new Map([
+      ["1,63,0", { name: "grass_block", boundingBox: "block" }],
+      ["1,64,0", { name: "air", boundingBox: "empty" }],
+    ]),
+  });
+  const rawCraft = furnBot.craft.bind(furnBot);
+  let tableCraftAttempts = 0;
+  furnBot.craft = async (recipe, batches = 1, tableBlock = null) => {
+    const outId = recipe?.result?.id;
+    if (outId === 58) {
+      tableCraftAttempts += 1;
+      // Fail first 2 inline attempts (simulating 450ms sync miss inside executeCraftAction("furnace")),
+      // then succeed on explicit ensureItem("crafting_table", 1)!
+      if (tableCraftAttempts <= 2) {
+        return;
+      }
+    }
+    await rawCraft(recipe, batches, tableBlock);
+  };
+
+  const furnRes = await executeAcquireAction(
+    furnBot,
+    { item_name: "furnace", count: 1 },
+    {
+      verifyCraftSync: true,
+      craftSyncTimeoutMs: 25,
+    },
+  );
+  assert.equal(furnRes.ok, true);
+  assert.equal(furnBot._invMap.get("furnace"), 1);
+  assert.ok(furnRes.steps_completed.some((s) => s.startsWith("craft:crafting_table")));
+  assert.ok(furnRes.steps_completed.some((s) => s.startsWith("craft:furnace")));
+
+  // 2. Cramped 1x1x2 shelter: acquire bed & 3x3 craft fail fast with sheltered_no_space,
+  //    while owned 2x2 craft (torch) still works, and snapshot reports in_shelter + sky telemetry!
+  const shelterBlocks = new Map();
+  // Sealed 1x1x2 shelter around (0, 61, 0): stone floor at 60, air at 61/62, dirt cap at 63, solid walls on 4 sides
+  shelterBlocks.set("0,60,0", { name: "stone", boundingBox: "block" });
+  shelterBlocks.set("0,61,0", { name: "air", boundingBox: "empty", skyLight: 0, light: 0 });
+  shelterBlocks.set("0,62,0", { name: "air", boundingBox: "empty", skyLight: 0, light: 0 });
+  shelterBlocks.set("0,63,0", { name: "dirt", boundingBox: "block" });
+  for (const [dx, dz] of [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ]) {
+    shelterBlocks.set(`${dx},61,${dz}`, { name: "dirt", boundingBox: "block" });
+    shelterBlocks.set(`${dx},62,${dz}`, { name: "dirt", boundingBox: "block" });
+  }
+  const shBot = makeRichCraftBot({
+    pos: vec3(0.5, 61, 0.5),
+    initialItems: [
+      { name: "coal", count: 2 },
+      { name: "stick", count: 2 },
+      { name: "oak_planks", count: 1 },
+    ],
+    blocks: shelterBlocks,
+  });
+  const shRt = new McRuntime({
+    config: makeConfig(),
+    createBotFn: () => shBot,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  shRt.connectBot();
+  shBot.emit("spawn");
+  shRt._shelterState.active = true;
+  shRt._refreshFromBot();
+
+  const shelterSnap = shRt.getSnapshot();
+  assert.equal(shelterSnap.in_shelter, true);
+  assert.equal(shelterSnap.sky_exposed, false);
+  assert.equal(shelterSnap.sky_light, 0);
+
+  // acquire bed inside shelter -> sheltered_no_space + wood_shortfall_logs > 0, zero hunting/gathering!
+  const bedRes = await shRt.dispatchGoal({ action_type: "acquire", item_name: "bed", count: 1 });
+  assert.equal(bedRes.ok, false);
+  assert.equal(bedRes.reason, "sheltered_no_space");
+  assert.equal(bedRes.in_shelter, true);
+  assert.ok(bedRes.wood_shortfall_logs >= 1);
+
+  // 3x3 craft inside shelter (wooden_pickaxe with planks+sticks but no adjacent table) -> sheltered_no_space
+  shBot._invMap.set("oak_planks", 8);
+  const pickRes = await shRt.dispatchGoal({ action_type: "craft", item_name: "wooden_pickaxe", count: 1 });
+  assert.equal(pickRes.ok, false);
+  assert.equal(pickRes.reason, "sheltered_no_space");
+  assert.equal(pickRes.in_shelter, true);
+
+  // 2x2 craft with owned materials inside shelter (torch) -> STILL succeeds!
+  const torchRes = await shRt.dispatchGoal({ action_type: "craft", item_name: "torch", count: 4 });
+  assert.equal(torchRes.ok, true);
+  assert.equal(torchRes.crafted_count, 4);
+
+  // 3. Open overworld sky vs underground cave vs nether sky telemetry
+  shRt._shelterState.active = false;
+  shBot.entity.position = vec3(10, 64, 10);
+  shBot.blockAt = (p) => {
+    const y = Math.floor(p.y);
+    if (y <= 63) return { name: "grass_block", boundingBox: "block", skyLight: 0 };
+    return { name: "air", boundingBox: "empty", skyLight: 15 };
+  };
+  shRt._refreshFromBot();
+  assert.equal(shRt.getSnapshot().in_shelter, false);
+  assert.equal(shRt.getSnapshot().sky_exposed, true);
+  assert.equal(shRt.getSnapshot().sky_light, 15);
+
+  // Underground cave (skyLight=0, stone ceiling)
+  shBot.blockAt = (p) => {
+    const y = Math.floor(p.y);
+    if (y === 64 || y === 65) return { name: "air", boundingBox: "empty", skyLight: 0 };
+    return { name: "stone", boundingBox: "block", skyLight: 0 };
+  };
+  shRt._refreshFromBot();
+  assert.equal(shRt.getSnapshot().sky_exposed, false);
+  assert.equal(shRt.getSnapshot().sky_light, 0);
+
+  // Nether -> null sky telemetry
+  shBot.game.dimension = "the_nether";
+  shRt._refreshFromBot();
+  assert.equal(shRt.getSnapshot().sky_exposed, null);
+  assert.equal(shRt.getSnapshot().sky_light, null);
+
+  shRt.stop();
+});
+
+test("verifier fixes: acquire internal interrupts preserve exact reason/threat_mob/steps_completed + trigger defense, and creeper interrupt preserves 远离苦力怕", async () => {
+  let fakeNow = 200_000;
+
+  // 1a. acquire internal interrupted_by_hazard (fire/lava) preserves exact reason (never clobbered to interrupted_by_threat)
+  const fireBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    blocks: new Map([["0,64,0", { name: "lava", boundingBox: "empty" }]]),
+  });
+  const fireRt = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "false" }),
+    createBotFn: () => fireBot,
+    nowFn: () => fakeNow,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  fireRt.connectBot();
+  fireBot.emit("spawn");
+  const hazRes = await fireRt.dispatchGoal({
+    action_type: "acquire",
+    item_name: "wooden_pickaxe",
+    count: 1,
+  });
+  assert.equal(hazRes.ok, false);
+  assert.equal(hazRes.interrupted, true);
+  assert.equal(hazRes.reason, "interrupted_by_hazard");
+  fireRt.stop();
+
+  // 1b. acquire internal interrupted_by_low_health after partial step preserves reason, threat_mob, steps_completed, AND starts solo evade
+  const lowHpBlocks = new Map([
+    ["2,64,0", { name: "oak_log", boundingBox: "block" }],
+    ["2,65,0", { name: "oak_log", boundingBox: "block" }],
+    ["-2,64,0", { name: "stone", boundingBox: "block" }],
+  ]);
+  const lowHpBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    health: 20,
+    blocks: lowHpBlocks,
+  });
+  const lowHpFleeGoals = [];
+  lowHpBot.pathfinder.setGoal = (g) => {
+    if (g) lowHpFleeGoals.push(g);
+  };
+  const origDig = lowHpBot.dig.bind(lowHpBot);
+  lowHpBot.dig = async (blk) => {
+    await origDig(blk);
+    // After first log is gathered, bot drops to low HP with a zombie at 8m (within 12m low-health guard)
+    lowHpBot.health = 5;
+    lowHpBot.entities[77] = { id: 77, name: "zombie", position: vec3(8, 64, 0) };
+  };
+  const lowHpRt = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "false", MC_COMBAT_MODE: "evade" }),
+    createBotFn: () => lowHpBot,
+    nowFn: () => fakeNow,
+    pickupSettleMs: 0,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  lowHpRt.connectBot();
+  lowHpBot.emit("spawn");
+  const lowHpRes = await lowHpRt.dispatchGoal({
+    action_type: "acquire",
+    item_name: "stone_pickaxe",
+    count: 1,
+  });
+  assert.equal(lowHpRes.ok, false);
+  assert.equal(lowHpRes.interrupted, true);
+  assert.equal(lowHpRes.reason, "interrupted_by_low_health");
+  assert.equal(lowHpRes.threat_mob, "zombie");
+  assert.equal(lowHpRes.partial, true);
+  assert.ok(lowHpRes.steps_completed.some((s) => s.startsWith("gather:oak_log")));
+  assert.ok(lowHpRt._evadePlan !== null);
+  assert.ok(lowHpFleeGoals.length >= 1);
+  assert.equal(lowHpRt.activity, "躲避怪物");
+  assert.equal(lowHpRes.snapshot.activity, "躲避怪物");
+  lowHpRt.stop();
+
+  // 1c. acquire internal interrupted_by_threat (creeper at 4m) preserves reason/threat_mob AND sets creeper flee + 远离苦力怕
+  const acqCreeperBot = makeRichCraftBot({
+    pos: vec3(0, 64, 0),
+    entities: { 81: { id: 81, name: "creeper", position: vec3(4, 64, 0) } },
+  });
+  const acqCreeperGoals = [];
+  acqCreeperBot.pathfinder.setGoal = (g) => {
+    if (g) acqCreeperGoals.push(g);
+  };
+  const acqCreeperRt = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "false", MC_COMBAT_MODE: "evade" }),
+    createBotFn: () => acqCreeperBot,
+    nowFn: () => fakeNow,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  acqCreeperRt.connectBot();
+  acqCreeperBot.emit("spawn");
+  const acqCreeperRes = await acqCreeperRt.dispatchGoal({
+    action_type: "acquire",
+    item_name: "wooden_pickaxe",
+    count: 1,
+  });
+  assert.equal(acqCreeperRes.ok, false);
+  assert.equal(acqCreeperRes.interrupted, true);
+  assert.equal(acqCreeperRes.reason, "interrupted_by_threat");
+  assert.equal(acqCreeperRes.threat_mob, "creeper");
+  assert.ok(acqCreeperRt._evadePlan !== null);
+  assert.ok(acqCreeperGoals.length >= 1);
+  assert.equal(acqCreeperRt.activity, "远离苦力怕");
+  assert.equal(acqCreeperRes.snapshot.activity, "远离苦力怕");
+  acqCreeperRt.stop();
+
+  // 2. Creeper interrupting active slow explore in solo mode preserves activity="远离苦力怕",
+  //    sets _evadePlan for solo _survivalTick follow-up, and clears cleanly once escaped!
+  const creepBot = makeRichCraftBot({ pos: vec3(0, 64, 0) });
+  const creepGoals = [];
+  creepBot.pathfinder.setGoal = (g) => {
+    if (g) creepGoals.push(g);
+  };
+  creepBot.pathfinder.goto = async () => {
+    await new Promise(() => {});
+  };
+  const creepRt = new McRuntime({
+    config: makeConfig({ MC_COMPANION_MODE: "false", MC_COMBAT_MODE: "evade" }),
+    createBotFn: () => creepBot,
+    nowFn: () => fakeNow,
+    stuckCheckIntervalMs: 0,
+    snapshotIntervalMs: 60_000,
+    survivalTickMs: 60_000,
+    companionTickMs: 60_000,
+  });
+  creepRt.connectBot();
+  creepBot.emit("spawn");
+
+  const explorePromise = creepRt.dispatchGoal({ action_type: "explore", timeout_ms: 10_000 });
+  await new Promise((r) => setTimeout(r, 20));
+
+  creepBot.entities[99] = { id: 99, name: "creeper", position: vec3(5, 64, 0) };
+  await creepRt._survivalTick();
+
+  const creepExpRes = await explorePromise;
+  assert.equal(creepExpRes.ok, false);
+  assert.equal(creepExpRes.interrupted, true);
+  assert.equal(creepExpRes.reason, "interrupted_by_threat");
+  assert.equal(creepExpRes.threat_mob, "creeper");
+  assert.equal(creepRt._activeGoalCancel, null);
+  assert.ok(creepRt._evadePlan !== null);
+  assert.equal(creepRt.activity, "远离苦力怕");
+  assert.equal(creepExpRes.snapshot.activity, "远离苦力怕");
+  assert.ok(creepGoals.length >= 1);
+
+  // Follow-up solo _survivalTick continues creeper retreat while creeper stays close
+  const goalsBeforeFollowup = creepGoals.length;
+  creepBot.entities[99].position = vec3(4, 64, 0);
+  await creepRt._survivalTick();
+  assert.ok(creepGoals.length > goalsBeforeFollowup);
+  assert.equal(creepRt.activity, "远离苦力怕");
+
+  // Once escaped far from creeper, solo _survivalTick clears _evadePlan and returns to 原地待命
+  creepBot.entities[99].position = vec3(30, 64, 0);
+  await creepRt._survivalTick();
+  assert.equal(creepRt._evadePlan, null);
+  assert.equal(creepRt.activity, "原地待命");
+  creepRt.stop();
+});

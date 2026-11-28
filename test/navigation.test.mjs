@@ -9,13 +9,16 @@ import { executeAcquireAction } from "../src/acquire.mjs";
 import { loadConfig } from "../src/protocol.mjs";
 import { createShelterState, executeShelterAction } from "../src/world_actions.mjs";
 import {
+  DRY_LAND_LIQUID_COST,
   HAZARD_AVOID_BLOCKS,
+  IN_WATER_LIQUID_COST,
   MOVEMENT_PROFILES,
   PAPER_SAFE_PLAYER_HALF_WIDTH,
   applyMovementProfile,
   applyPaperPhysicsMargin,
   createMovementProfile,
   installPillarPlaceGuard,
+  isBotCurrentlyInWater,
   isNaturalRockBlock,
   isNaturalSoftBlock,
   isNearPlayerStructure,
@@ -1054,4 +1057,67 @@ test("v2.10.4: applyPaperPhysicsMargin bumps prismarine-physics playerHalfWidth 
   assert.ok(bot.physics.playerHalfWidth > Math.fround(0.6) / 2);
   // Idempotent when already >= safe margin
   assert.equal(applyPaperPhysicsMargin(bot), false);
+});
+
+test("Real A* Sandbox 5: high dry-land liquidCost avoids water shortcuts while in-water bot reliably escapes to dry shore", () => {
+  // 1. Dry-land bot at (0.5, 64, 0.5) heading to (10, 64, 0).
+  //    A 3-wide water pond sits across x=4..6, z=-3..3 at y=63, with a dry grass land detour at z=4.
+  const pondBot = makeRealVoxelBot({
+    pos: vec3(0.5, 64, 0.5),
+    blockFn: (x, y, z) => {
+      if (y <= 62) return "stone";
+      if (y === 63) {
+        if (x >= 4 && x <= 6 && z >= -3 && z <= 3) return "water";
+        return "grass_block";
+      }
+      return "air";
+    },
+  });
+  assert.equal(isBotCurrentlyInWater(pondBot), false);
+  for (const profile of [
+    MOVEMENT_PROFILES.CRUISE_WALK,
+    MOVEMENT_PROFILES.NATURAL_TRAVERSE,
+    MOVEMENT_PROFILES.COMBAT_NODIG,
+  ]) {
+    const m = createMovementProfile(pondBot, profile);
+    assert.equal(m.liquidCost, DRY_LAND_LIQUID_COST);
+    assert.ok(m.liquidCost >= 16 && m.liquidCost <= 24);
+  }
+
+  const dryMoves = createMovementProfile(pondBot, MOVEMENT_PROFILES.CRUISE_WALK);
+  const dryRes = solveRealAStar(pondBot, dryMoves, new GoalNear(10, 64, 0, 1));
+  assert.equal(dryRes.status, "success");
+  assert.ok(dryRes.path.length > 0);
+  // Every planned step must stay completely out of the water pond!
+  for (const node of dryRes.path) {
+    const feetBlk = pondBot.blockAt(vec3(node.x, node.y, node.z));
+    assert.notEqual(
+      feetBlk.name,
+      "water",
+      `dry-land A* stepped into water at (${node.x},${node.y},${node.z})`,
+    );
+  }
+
+  // 2. Bot ALREADY submerged inside a wide lake (x=-5..5, z=-5..5, y=63 water; dry shore at x>=6)
+  const lakeBot = makeRealVoxelBot({
+    pos: vec3(0.5, 63, 0.5),
+    blockFn: (x, y, z) => {
+      if (y <= 62) return "dirt";
+      if (y === 63) {
+        if (x >= -5 && x <= 5 && z >= -5 && z <= 5) return "water";
+        return "grass_block";
+      }
+      return "air";
+    },
+  });
+  lakeBot.entity.isInWater = true;
+  assert.equal(isBotCurrentlyInWater(lakeBot), true);
+  const escapeMoves = createMovementProfile(lakeBot, MOVEMENT_PROFILES.CRUISE_WALK);
+  assert.equal(escapeMoves.liquidCost, IN_WATER_LIQUID_COST);
+
+  const shoreRes = solveRealAStar(lakeBot, escapeMoves, new GoalNear(7, 64, 0, 1));
+  assert.equal(shoreRes.status, "success");
+  assert.ok(shoreRes.path.length > 0);
+  const endNode = shoreRes.path[shoreRes.path.length - 1];
+  assert.ok(endNode.x >= 6 && endNode.y >= 64, `expected dry shore escape, got (${endNode.x},${endNode.y},${endNode.z})`);
 });

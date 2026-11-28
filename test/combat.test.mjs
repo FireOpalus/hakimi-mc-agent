@@ -6,7 +6,16 @@ import { WebSocket } from "ws";
 import {
   classifyCombatEntity,
   createCombatState,
+  findCriticalGoalInterruptThreat,
+  isDrownedHighThreat,
+  isDrownedHoldingTrident,
+  isEndermanProvoked,
+  isRangedHostileEntity,
+  isRangedShieldEntity,
+  observeEndermanBehavior,
+  recordBotHurtEndermanAggro,
   runGuardCombatStep,
+  updateEvadeShieldDefense,
 } from "../src/combat.mjs";
 import { createMcBridgeServer } from "../src/index.mjs";
 
@@ -503,4 +512,136 @@ test("WS integration: guard/evade RPC & whitelisted chat toggle mode, enforce al
   } finally {
     await server.close();
   }
+});
+
+test("trident drowned detection across Paper 26.1.2 equipment forms, conservative in-water/close defense, and shield raise", async () => {
+  const bot = createCombatMockBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "iron_sword", count: 1 }],
+    offHand: { name: "shield", count: 1 },
+  });
+  bot.registry = {
+    itemsByName: { trident: { id: 1234, name: "trident" } },
+    items: { 1234: { id: 1234, name: "trident" } },
+  };
+  bot.blockAt = (p) => {
+    const x = Math.floor(p.x);
+    const y = Math.floor(p.y);
+    if (x >= 10 && y === 64) return { name: "water", boundingBox: "empty" };
+    if (y <= 63) return { name: "grass_block", boundingBox: "block" };
+    return { name: "air", boundingBox: "empty" };
+  };
+
+  // 1. Multiple Mineflayer / Paper 26.1.2 trident representations
+  const dHeld = { id: 1, name: "drowned", position: vec3(15, 64, 0), heldItem: { name: "trident" } };
+  const dOffEq = { id: 2, name: "drowned", position: vec3(15, 64, 0), equipment: [null, { name: "minecraft:trident" }] };
+  const dIdEq = { id: 3, name: "drowned", position: vec3(15, 64, 0), equipment: [{ type: 1234 }] };
+  const dMainStr = { id: 4, name: "drowned", position: vec3(15, 64, 0), mainHand: "trident" };
+  for (const d of [dHeld, dOffEq, dIdEq, dMainStr]) {
+    assert.equal(isDrownedHoldingTrident(d, bot), true);
+    assert.equal(isDrownedHighThreat(d, bot, 15), true);
+    assert.equal(isRangedHostileEntity(d, bot, 15), true);
+    assert.equal(isRangedShieldEntity(d, bot, 15), true);
+  }
+
+  // 2. Unarmed drowned IN WATER at 14m -> conservatively treated as ranged shield high threat!
+  const dWater = { id: 5, name: "drowned", position: vec3(14, 64, 0) };
+  assert.equal(isDrownedHoldingTrident(dWater, bot), false);
+  assert.equal(isDrownedHighThreat(dWater, bot, 14), true);
+  assert.equal(isRangedHostileEntity(dWater, bot, 14), true);
+  assert.equal(isRangedShieldEntity(dWater, bot, 14), true);
+
+  // 3. Close drowned on dry land (<= 12m, unsynced equipment) -> conservatively high threat; far dry unarmed drowned (16m) -> not ranged
+  const dCloseDry = { id: 6, name: "drowned", position: vec3(-10, 64, 0) };
+  const dFarDry = { id: 7, name: "drowned", position: vec3(-16, 64, 0) };
+  assert.equal(isDrownedHighThreat(dCloseDry, bot, 10), true);
+  assert.equal(isDrownedHighThreat(dFarDry, bot, 16), false);
+
+  // 4. updateEvadeShieldDefense raises shield against trident drowned at 15m AND even at 4m (never drops shield into melee sprint)
+  bot.entities = { 1: dHeld };
+  const st = createCombatState();
+  const shieldFar = updateEvadeShieldDefense({ bot, combatState: st, nowMs: 1_000 });
+  assert.equal(shieldFar.raised, true);
+  assert.equal(st.shieldRaised, true);
+
+  dHeld.position = vec3(4, 64, 0);
+  const shieldClose = updateEvadeShieldDefense({ bot, combatState: st, nowMs: 1_200 });
+  assert.equal(shieldClose.raised, true);
+  assert.equal(st.shieldRaised, true);
+
+  // 5. Guard mode raises shield while approaching a trident drowned
+  dHeld.position = vec3(6, 64, 0);
+  const stGuard = createCombatState();
+  const guardRes = await runGuardCombatStep({
+    bot,
+    combatState: stGuard,
+    health: 20,
+    food: 20,
+    nowMs: 2_000,
+  });
+  assert.equal(guardRes.action, "approach_hostile");
+  assert.equal(stGuard.shieldRaised, true);
+});
+
+test("enderman aggro detection combines drifted Paper 26.1.2 metadata, damage-source TTL, and behavioral rush/teleport tracking", async () => {
+  // 1. Metadata index drift (index 19 = true, indices 17 & 18 absent/false)
+  const driftedMeta = new Array(20).fill(false);
+  driftedMeta[19] = true;
+  const driftedEnder = { id: 50, name: "enderman", position: vec3(6, 64, 0), metadata: driftedMeta };
+  assert.equal(isEndermanProvoked(driftedEnder), true);
+  assert.equal(classifyCombatEntity(driftedEnder, createCombatMockBot()), "engageable");
+
+  // 2. Damage-source aggro TTL tracking when metadata has zero flags
+  const ender = { id: 51, name: "enderman", position: vec3(5, 64, 0), metadata: [] };
+  const bot = createCombatMockBot({
+    pos: vec3(0, 64, 0),
+    items: [{ name: "iron_sword", count: 1 }],
+    entities: { 51: ender },
+  });
+  const st = createCombatState();
+  assert.equal(isEndermanProvoked(ender, st, 10_000), false);
+  assert.equal(classifyCombatEntity(ender, bot, st, 10_000), "avoid");
+
+  const marked = recordBotHurtEndermanAggro(bot, st, { nowMs: 10_000 });
+  assert.equal(marked, 1);
+  assert.equal(isEndermanProvoked(ender, st, 10_500), true);
+  assert.equal(classifyCombatEntity(ender, bot, st, 10_500), "engageable");
+  assert.equal(findCriticalGoalInterruptThreat(bot, { combatState: st, nowMs: 10_500 })?.name, "enderman");
+
+  // Guard engages tracked aggro enderman!
+  const guardStep = await runGuardCombatStep({
+    bot,
+    combatState: st,
+    health: 20,
+    food: 20,
+    nowMs: 10_500,
+  });
+  assert.equal(guardStep.action, "approach_hostile");
+  assert.equal(guardStep.target?.name, "enderman");
+
+  // After TTL expires (45s), returns to neutral
+  assert.equal(isEndermanProvoked(ender, st, 60_000), false);
+
+  // 3. Passive enderman at 11m is NOT falsely marked when a zombie at 2m hits the bot
+  const st2 = createCombatState();
+  const passiveBot = createCombatMockBot({
+    pos: vec3(0, 64, 0),
+    entities: {
+      52: { id: 52, name: "enderman", position: vec3(11, 64, 0), metadata: [] },
+      53: { id: 53, name: "zombie", position: vec3(2, 64, 0) },
+    },
+  });
+  assert.equal(recordBotHurtEndermanAggro(passiveBot, st2, { nowMs: 1_000 }), 0);
+  assert.equal(isEndermanProvoked(passiveBot.entities[52], st2, 1_000), false);
+
+  // 4. Behavioral teleport ambush / rapid rush marks enderman aggro with zero metadata
+  const st3 = createCombatState();
+  const rushEnder = { id: 54, name: "enderman", position: vec3(11, 64, 0), metadata: [] };
+  const rushBot = createCombatMockBot({ pos: vec3(0, 64, 0), entities: { 54: rushEnder } });
+  observeEndermanBehavior(rushBot, st3, { nowMs: 1_000 });
+  assert.equal(isEndermanProvoked(rushEnder, st3, 1_000), false);
+  // Teleport / rush from 11m straight to 3m in 500ms
+  rushEnder.position = vec3(3, 64, 0);
+  observeEndermanBehavior(rushBot, st3, { nowMs: 1_500 });
+  assert.equal(isEndermanProvoked(rushEnder, st3, 1_500), true);
 });

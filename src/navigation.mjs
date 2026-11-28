@@ -469,6 +469,45 @@ export function installPillarPlaceGuard(bot, { maxWaitMs = 700, pollIntervalMs =
   return bot;
 }
 
+// High liquidCost on dry land prevents A* from taking river/pond shortcuts;
+// when already submerged, a moderate penalty still strongly pulls toward dry shore
+// without turning in-water escape into an unfocused BFS timeout.
+export const DRY_LAND_LIQUID_COST = 20;
+export const IN_WATER_LIQUID_COST = 6;
+
+const LIQUID_WATER_NAMES = new Set(["water", "flowing_water", "bubble_column"]);
+
+export function isBotCurrentlyInWater(bot) {
+  if (!bot) return false;
+  const p = bot.entity?.position;
+  if (p && typeof bot.blockAt === "function") {
+    try {
+      const bx = Math.floor(p.x ?? 0);
+      const by = Math.floor(p.y ?? 0);
+      const bz = Math.floor(p.z ?? 0);
+      const feet = bot.blockAt(vec3(bx, by, bz));
+      const feetName = normalizeCanonicalItemId(feet?.name);
+      if (LIQUID_WATER_NAMES.has(feetName)) return true;
+      const below = bot.blockAt(vec3(bx, by - 1, bz));
+      const belowName = normalizeCanonicalItemId(below?.name);
+      if (
+        feet &&
+        (feetName === "air" || feetName === "cave_air" || feetName === "void_air" || feet.boundingBox === "empty") &&
+        below &&
+        below.boundingBox !== "empty" &&
+        belowName &&
+        !LIQUID_WATER_NAMES.has(belowName) &&
+        belowName !== "air"
+      ) {
+        return false;
+      }
+    } catch {
+      // Ignore partial mock lookup errors
+    }
+  }
+  return Boolean(bot.entity?.isInWater);
+}
+
 function resolveProfileSpec(bot, profileName, opts = {}) {
   const health =
     typeof opts.health === "number" && Number.isFinite(opts.health)
@@ -488,6 +527,13 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
     typeof opts.searchRadius === "number" && Number.isFinite(opts.searchRadius)
       ? Math.max(8, Math.min(96, Math.floor(opts.searchRadius)))
       : null;
+  const requestedLiquidCost =
+    typeof opts.liquidCost === "number" && Number.isFinite(opts.liquidCost)
+      ? Math.max(1, Math.min(64, Math.floor(opts.liquidCost)))
+      : null;
+  const inWater = typeof opts.inWater === "boolean" ? opts.inWater : isBotCurrentlyInWater(bot);
+  const effectiveLiquidCost =
+    requestedLiquidCost ?? (inWater ? IN_WATER_LIQUID_COST : DRY_LAND_LIQUID_COST);
 
   if (profileName === MOVEMENT_PROFILES.COMBAT_NODIG) {
     return {
@@ -497,7 +543,7 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
       allowScaffold: false,
       digCost: 8,
       placeCost: 6,
-      liquidCost: 4,
+      liquidCost: effectiveLiquidCost,
       entityCost: 2,
       maxDropDown: 3,
       canOpenDoors: false,
@@ -517,7 +563,7 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
       allowScaffold: opts.allowStepScaffold !== false,
       digCost: 4,
       placeCost: 5,
-      liquidCost: 4,
+      liquidCost: effectiveLiquidCost,
       entityCost: 2,
       maxDropDown: safeDrop,
       canOpenDoors: true,
@@ -538,7 +584,7 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
       allowScaffold: opts.allowStepScaffold !== false,
       digCost: 5,
       placeCost: 5,
-      liquidCost: 4,
+      liquidCost: effectiveLiquidCost,
       entityCost: 2,
       maxDropDown: safeDrop,
       canOpenDoors: true,
@@ -559,7 +605,7 @@ function resolveProfileSpec(bot, profileName, opts = {}) {
     allowScaffold,
     digCost: 4,
     placeCost: 5,
-    liquidCost: 4,
+    liquidCost: effectiveLiquidCost,
     entityCost: 2,
     maxDropDown: requestedDrop ?? 3,
     canOpenDoors: true,

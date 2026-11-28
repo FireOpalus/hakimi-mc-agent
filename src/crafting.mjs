@@ -706,6 +706,51 @@ function isSafeSolidGround(block) {
   return true;
 }
 
+/**
+ * Detect whether the bot is currently boxed inside an emergency 1x1x2 shelter
+ * (explicit shelter flag or surrounded on all 4 cardinal sides with roof/head enclosure),
+ * where walking to external tables/trees or placing a 3x3 crafting table cannot succeed.
+ */
+export function isCrampedEnclosedSpace(bot, { inShelter = false } = {}) {
+  if (inShelter === true) return true;
+  const origin = bot?.entity?.position;
+  if (!origin || typeof bot.blockAt !== "function") return false;
+  const bx = Math.floor(origin.x ?? 0);
+  const by = Math.floor(origin.y ?? 0);
+  const bz = Math.floor(origin.z ?? 0);
+
+  const isBlockingSolid = (blk) => {
+    if (!blk) return false;
+    const name = normalizeCanonicalItemId(blk.name);
+    if (!name || REPLACEABLE_BLOCKS.has(name)) return false;
+    if (blk.boundingBox === "empty") return false;
+    return true;
+  };
+
+  let feetBlocked = 0;
+  let headBlocked = 0;
+  for (const [dx, dz] of [
+    [1, 0],
+    [-1, 0],
+    [0, 1],
+    [0, -1],
+  ]) {
+    try {
+      if (isBlockingSolid(bot.blockAt(vec3(bx + dx, by, bz + dz)))) feetBlocked += 1;
+      if (isBlockingSolid(bot.blockAt(vec3(bx + dx, by + 1, bz + dz)))) headBlocked += 1;
+    } catch {
+      // Ignore partial mock lookup errors
+    }
+  }
+  let ceilingBlocked = false;
+  try {
+    ceilingBlocked = isBlockingSolid(bot.blockAt(vec3(bx, by + 2, bz)));
+  } catch {
+    ceilingBlocked = false;
+  }
+  return (feetBlocked >= 4 && ceilingBlocked) || (feetBlocked >= 4 && headBlocked >= 4);
+}
+
 export async function placeCraftingTableSafely(bot) {
   const origin = bot?.entity?.position;
   if (
@@ -826,7 +871,14 @@ export function computeWoodShortfall(
     } else if (entry.item === "stick") {
       extraPlanksNeed += Math.ceil(entry.shortfall / 4) * 2;
     } else if (entry.item === "crafting_table") {
-      extraPlanksNeed += entry.shortfall * 4;
+      const tablePlanksGap = Math.max(
+        0,
+        entry.shortfall * 4 +
+          Math.max(0, recipePlanksForOne) +
+          Math.max(0, recipeStickPlanksForOne) -
+          countAllPlanks(countsMap),
+      );
+      extraPlanksNeed += tablePlanksGap;
     }
   }
   if (needsTableCraft && (countsMap.get("crafting_table") ?? 0) === 0) {
@@ -897,6 +949,7 @@ export async function executeCraftAction(
     markUnreachableFn = null,
     verifyCraftSync = null,
     craftSyncTimeoutMs = 450,
+    inShelter = false,
   } = {},
 ) {
   const parsed = parseCraftParams(params);
@@ -1027,8 +1080,15 @@ export async function executeCraftAction(
       };
     }
 
-    // Locate existing reachable crafting_table within 16 blocks, or fall back to placing one nearby
-    const nearby = findNearbyCraftingTable(bot, CRAFTING_TABLE_SEARCH_RADIUS, { isUnreachableFn });
+    const crampedShelter = isCrampedEnclosedSpace(bot, { inShelter });
+
+    // Locate existing reachable crafting_table within 16 blocks (or <=3.5 inside shelter),
+    // otherwise fall back to placing one nearby.
+    const nearby = findNearbyCraftingTable(
+      bot,
+      crampedShelter ? 3.5 : CRAFTING_TABLE_SEARCH_RADIUS,
+      { isUnreachableFn },
+    );
     if (nearby) {
       let reachedNearby = true;
       if (nearby.dist > 3.5 && typeof gotoFn === "function") {
@@ -1049,6 +1109,18 @@ export async function executeCraftAction(
       }
     }
     if (!usedTable) {
+      if (crampedShelter) {
+        return {
+          ok: false,
+          accepted: true,
+          reason: "sheltered_no_space",
+          item_name: itemName,
+          requested_count: requestedCount,
+          crafted_count: 0,
+          missing_materials: [],
+          summary: "当前在封闭掩体内空间不足，无法放置工作台完成3x3合成",
+        };
+      }
       // Use crafting_table from inventory or craft one from >= 4 planks
       let curCounts = countInventoryByName(bot);
       if ((curCounts.get("crafting_table") ?? 0) === 0) {
@@ -1069,16 +1141,21 @@ export async function executeCraftAction(
           recipePlanksForOne,
         );
         if (chosenTableRecipe && totalPlanksNow >= 4 + recipePlanksForOne) {
-          try {
-            const beforeTables = curCounts.get("crafting_table") ?? 0;
-            await bot.craft(chosenTableRecipe, 1, null);
-            await waitForCraftInventoryConfirm(bot, "crafting_table", beforeTables, {
-              signal,
-              verifySync: shouldVerifySync,
-              timeoutMs: craftSyncTimeoutMs,
-            });
-          } catch {
-            // Fall through to check below
+          for (let tableTry = 0; tableTry < 2 && !signal?.aborted; tableTry += 1) {
+            try {
+              const beforeTables = countInventoryByName(bot).get("crafting_table") ?? 0;
+              await bot.craft(chosenTableRecipe, 1, null);
+              const sync = await waitForCraftInventoryConfirm(bot, "crafting_table", beforeTables, {
+                signal,
+                verifySync: shouldVerifySync,
+                timeoutMs: craftSyncTimeoutMs,
+              });
+              if (sync.aborted || !shouldVerifySync || sync.confirmed) {
+                break;
+              }
+            } catch {
+              break;
+            }
           }
         }
         curCounts = countInventoryByName(bot);
@@ -1134,15 +1211,18 @@ export async function executeCraftAction(
 
       const placed = await placeCraftingTableSafely(bot);
       if (!placed.ok) {
+        const isEnclosed = isCrampedEnclosedSpace(bot, { inShelter });
         return {
           ok: false,
           accepted: true,
-          reason: placed.reason,
+          reason: isEnclosed ? "sheltered_no_space" : placed.reason,
           item_name: itemName,
           requested_count: requestedCount,
           crafted_count: 0,
           missing_materials: [],
-          summary: "周围3格内未找到安全实心地面放置工作台",
+          summary: isEnclosed
+            ? "当前在封闭掩体内空间不足，无法放置工作台完成3x3合成"
+            : "周围3格内未找到安全实心地面放置工作台",
         };
       }
       craftingTableBlock = placed.tableBlock;
